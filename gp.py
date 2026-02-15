@@ -1,5 +1,5 @@
 from typing import NamedTuple, Optional
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Key
 from dataclasses import dataclass, field
 
 import jax
@@ -8,6 +8,7 @@ import jax.scipy as jsp
 import jax.random as jr
 from jax.numpy.linalg import norm
 
+import numpy as np
 import scipy
 from tqdm import tqdm
 import joblib
@@ -89,7 +90,8 @@ def admm_x_update(
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n o"],
     bounds: list[tuple[float, float]],
-    maxiter: int = 100,
+    maxiter: int = 10,
+    jitter_key: Key | None = None,
 ) -> Float[Array, "o d+1"]:
     new_x = [
         scipy.optimize.minimize(
@@ -101,9 +103,13 @@ def admm_x_update(
             bounds=bounds,
             options=dict(maxiter=maxiter, ftol=EPS, gtol=0),
         )
-        for i in range(len(admm_x))
+        for i in range(admm_x.shape[0])
     ]
-    return jnp.stack([opt["x"] for opt in new_x])  # type: ignore
+    new_x = [opt["x"] for opt in new_x]
+    new_x = jnp.stack(new_x, axis=0)
+    if jitter_key is not None:  # add noise to escape local minima
+        new_x = new_x * (1 + 1e-3 * jr.normal(jitter_key, new_x.shape))
+    return new_x
 
 
 @jax.jit
@@ -114,19 +120,13 @@ def admm_z_update(
     rho: float,
     l1_penalty: float,
 ) -> Float[Array, "o d+1"]:
-    # target = admm_x + admm_u
-    # threshold = l1_penalty / (rho + EPS)
-    # prox = jnp.maximum(0, 1 - threshold / norm(target, axis=0))
-    # prox = prox.at[-1].set(1)  # do not penalize g
-    # return prox * target
-
-    def soft_threshold(x, threshold):
-        return jnp.sign(x) * jnp.maximum(jnp.abs(x) - threshold, 0.0)
-
-    return soft_threshold(admm_x + admm_u, l1_penalty / rho)
+    prox = jnp.maximum(0, 1 - (l1_penalty / rho) / norm(admm_x + admm_u, axis=0))
+    prox = prox.at[..., -1].set(1)  # do not penalize g
+    new_z = prox * (admm_x + admm_u)
+    return new_z
 
 
-def auto_bounds(x, min_cor=0.01, max_cor=0.5):
+def hetgpy_auto_bounds(x, min_cor=0.01, max_cor=0.5):
     # rescale X to [0,1]^d
     x_min, x_max = x.min(axis=0), x.max(axis=0)
     x = (x - x_min) @ jnp.diag(1 / (x_max - x_min))
@@ -153,9 +153,9 @@ class Parameters(NamedTuple):
 
 @dataclass
 class GaussianProcessRegressor:
-    l1_penalty: float = 0.0
-    max_iterations: int = 100
-    tollerance: float = 1e-3
+    l1_penalty: float
+    max_iterations: int = 1000
+    tollerance: float = 1e-4
     warm_start: Optional[Parameters] = None
 
     # params to fit after training
@@ -168,28 +168,30 @@ class GaussianProcessRegressor:
         n, o = y.shape
 
         # Determine bounds and initialization
-        lower, upper = auto_bounds(x)
+        lower, upper = hetgpy_auto_bounds(x)
         bounds = [(1 / u**0.5, 1 / l**0.5) for l, u in zip(lower, upper)] + [(EPS, 1e2)]
-        # if self.l1_penalty > EPS:  # allow for l1 to do its job
-        #     bounds = [(EPS, u) for l, u in bounds]
+        if self.l1_penalty > EPS:  # allow for l1 to do its job
+            bounds = [(0.0, u) for l, u in bounds[:-1]] + [bounds[-1]]
 
-
-        init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
+        # init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
+        init_theta = jnp.tile(0.5 * 1 / (lower) ** 0.5, (o, 1))
         init_g = jnp.array([0.1] * o)
         if self.warm_start is not None:
-            init_theta = self.warm_start.theta
-            init_g = self.warm_start.g
+            init_theta = self.warm_start.theta.clip(min=1e-2)
+            init_g = self.warm_start.g.clip(min=1e-4, max=1e-1)
         init_par = jnp.concatenate([init_theta, init_g[:, None]], axis=1)
 
         # initialize admm state
         admm_x = jnp.array(init_par)
-        admm_z = jnp.zeros_like(init_par)
+        admm_z = jnp.array(init_par)  # regularizes first x update to stay close to init
         admm_u = jnp.zeros_like(init_par)
         rho = 1.0
 
         trajectory = [(admm_x, admm_z, admm_u, rho)]
         for iter in tqdm(range(self.max_iterations), desc="ADMM iterations"):
-            new_admm_x = admm_x_update(admm_x, admm_z, admm_u, rho, x, y, bounds)
+            new_admm_x = admm_x_update(
+                admm_x, admm_z, admm_u, rho, x, y, bounds, jitter_key=jr.key(iter)
+            )
             new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, self.l1_penalty)
             new_admm_u = admm_u + new_admm_x - new_admm_z
 
