@@ -119,10 +119,17 @@ def admm_z_update(
     admm_u: Float[Array, "o d+1"],
     rho: float,
     l1_penalty: float,
-) -> Float[Array, "o d+1"]:
-    prox = jnp.maximum(0, 1 - (l1_penalty / rho) / norm(admm_x + admm_u, axis=0))
-    prox = prox.at[..., -1].set(1)  # do not penalize g
-    new_z = prox * (admm_x + admm_u)
+) -> Float[Array, "o 3d+1"]:
+    theta = (admm_x + admm_u)[:, :-1]
+    g = (admm_x + admm_u)[:, -1]
+
+    # theta = rearrange(theta, "o (d k) -> (o k) d", k=3)  # group by sensor
+    prox = jnp.maximum(0, 1 - (l1_penalty / rho) / norm(theta, axis=0))
+    theta = prox * theta
+    # theta = rearrange(theta, "(o k) d -> o (d k)", k=3)  # back to original shape
+
+    new_z = admm_z.at[:, :-1].set(theta)
+    new_z = new_z.at[:, -1].set(g)  # no regularization on g
     return new_z
 
 
@@ -156,41 +163,32 @@ class GaussianProcessRegressor:
     l1_penalty: float
     max_iterations: int = 1000
     tollerance: float = 1e-4
-    warm_start: Optional[Parameters] = None
+    jitter: bool = True
+    warm_start_theta: Optional[Float[Array, "o d"]] = None
+    warm_start_g: Optional[Float[Array, "o"]] = None
 
     # params to fit after training
     parameters: Parameters = field(init=False)
     x: Float[Array, "n d"] = field(init=False)
     y: Float[Array, "n o"] = field(init=False)
 
-    def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"]):
-        n, d = x.shape
-        n, o = y.shape
-
-        # Determine bounds and initialization
-        lower, upper = hetgpy_auto_bounds(x)
-        bounds = [(1 / u**0.5, 1 / l**0.5) for l, u in zip(lower, upper)] + [(EPS, 1e2)]
-        if self.l1_penalty > EPS:  # allow for l1 to do its job
-            bounds = [(0.0, u) for l, u in bounds[:-1]] + [bounds[-1]]
-
-        # init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
-        init_theta = jnp.tile(0.5 * 1 / (lower) ** 0.5, (o, 1))
-        init_g = jnp.array([0.1] * o)
-        if self.warm_start is not None:
-            init_theta = self.warm_start.theta.clip(min=1e-2)
-            init_g = self.warm_start.g.clip(min=1e-4, max=1e-1)
-        init_par = jnp.concatenate([init_theta, init_g[:, None]], axis=1)
-
-        # initialize admm state
-        admm_x = jnp.array(init_par)
-        admm_z = jnp.array(init_par)  # regularizes first x update to stay close to init
-        admm_u = jnp.zeros_like(init_par)
+    def admm(
+        self,
+        x0: Float[Array, "o d+1"],
+        x_train: Float[Array, "n d"],
+        y_train: Float[Array, "n o"],
+        bounds: list[tuple[float, float]],
+    ):
+        admm_x = x0
+        admm_z = x0
+        admm_u = jnp.zeros_like(x0)
         rho = 1.0
 
         trajectory = [(admm_x, admm_z, admm_u, rho)]
         for iter in tqdm(range(self.max_iterations), desc="ADMM iterations"):
+            k = jr.key(iter) if self.jitter else None
             new_admm_x = admm_x_update(
-                admm_x, admm_z, admm_u, rho, x, y, bounds, jitter_key=jr.key(iter)
+                admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, jitter_key=k
             )
             new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, self.l1_penalty)
             new_admm_u = admm_u + new_admm_x - new_admm_z
@@ -219,11 +217,42 @@ class GaussianProcessRegressor:
                 break
         else:
             print("ADMM did not converge within the maximum number of iterations.")
+        return trajectory
 
-        # extract the optimal parameters and infer the rest
-        theta = admm_x[:, :-1]
-        g = admm_x[:, -1]
-        _, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
+    def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"]):
+        n, d = x.shape
+        n, o = y.shape
+
+        # initialization and bounds
+        lower, upper = hetgpy_auto_bounds(x)
+        bounds = [(1 / u**0.5, 1 / l**0.5) for l, u in zip(lower, upper)] + [(EPS, 1e2)]
+        if self.l1_penalty > EPS:  # allow for l1 to do its job
+            bounds = [(0.0, u) for l, u in bounds[:-1]] + [bounds[-1]]
+
+        init_theta = jnp.tile(0.5 * 1 / (lower) ** 0.5, (o, 1))
+        init_g = jnp.array([0.1] * o)
+
+        # initialize admm state
+        if self.warm_start_theta is not None:
+            init_theta = self.warm_start_theta
+        if self.warm_start_g is not None:
+            init_g = self.warm_start_g
+
+        results = []
+        for g in 10 ** jnp.linspace(-2, 0, 100):
+            init_g = jnp.array([g] * o)
+            x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=1)
+            trajectory = self.admm(x0, x_train=x, y_train=y, bounds=bounds)
+
+            # extract the optimal parameters and infer the rest
+            admm_x = trajectory[-1][0]
+            theta = admm_x[:, :-1]
+            g = admm_x[:, -1]
+            ll, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
+            results.append((ll, trajectory, theta, g, b, nu))
+
+        # get the best result across different initializations
+        ll, trajectory, theta, g, b, nu = max(results, key=lambda r: r[0])
 
         # save stuff
         self.trajectory = trajectory

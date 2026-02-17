@@ -33,7 +33,10 @@ regularizations = list(10 ** jnp.linspace(0, 4, 20))[::-1]
 for i, l in enumerate(regularizations):
     model = gp.GaussianProcessRegressor(
         l1_penalty=l,
-        warm_start=models[-1].parameters if models else None,
+        max_iterations=1000,
+        tollerance=1e-4,
+        jitter=True,
+        warm_start_theta=models[-1].parameters.theta if models else None,
     )
     model.fit(x=x_train, y=y_train)
     models.append(model)
@@ -42,8 +45,7 @@ for i, l in enumerate(regularizations):
     xs = jnp.array([x for x, z, u, rho in model.trajectory])
     zs = jnp.array([z for x, z, u, rho in model.trajectory])
     us = jnp.array([u for x, z, u, rho in model.trajectory])
-    lims = (0.9 * min(xs.min(), zs.min() - 0.01), 1.1 * max(xs.max(), zs.max()) + 0.01)
-
+    lims = (min(xs.min(), zs.min() - 0.01), max(xs.max(), zs.max()) + 0.01)
     t1 = jnp.linspace(*lims, 50)
     t2 = jnp.linspace(*lims, 50)
     theta = jnp.stack([t.ravel() for t in jnp.meshgrid(t1, t2)], axis=1)
@@ -61,9 +63,6 @@ for i, l in enumerate(regularizations):
     # plot the ADMM trajectory
     plt.plot(*xs[:, 0, :2].T, marker="*", color="green", label="x path", alpha=0.5)
     plt.plot(*zs[:, 0, :2].T, marker="*", color="blue", label="z path", alpha=0.5)
-    # plt.plot(
-    #     *((zs - us)[:, 0, :2].T), marker="*", color="black", label="z-u path", alpha=0.5
-    # )
 
     # plot the minimum and learned parameters
     plt.plot(*theta[jnp.argmin(z)], marker="o", color="white", label="minimum")
@@ -95,7 +94,7 @@ plt.legend()
 plt.grid()
 plt.subplot(2, 1, 2)
 plt.plot(regularizations, thetas, marker="o", label="lengthscale")
-plt.plot(regularizations, gs, marker="o", label="nugget", color="black", alpha=0.1)
+# plt.plot(regularizations, gs, marker="o", label="nugget", color="black", alpha=0.1)
 plt.xscale("log")
 plt.xlabel("Regularization lambda")
 plt.ylabel("Learned lengthscale")
@@ -103,7 +102,7 @@ plt.title("Effect of regularization on learned lengthscale")
 plt.legend()
 plt.grid()
 plt.tight_layout()
-plt.savefig("figures/test_results.pdf")
+plt.savefig("figures/test0_results.pdf")
 plt.close()
 
 
