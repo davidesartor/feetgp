@@ -1,14 +1,17 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import matplotlib.pyplot as plt
 
+import os
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn import base
 from sklearn.metrics import r2_score
 import gp
 
-
 jax.config.update("jax_enable_x64", True)
+os.makedirs("figures", exist_ok=True)
+os.makedirs("models", exist_ok=True)
 
 
 # define the problem
@@ -27,7 +30,6 @@ x_train = jr.uniform(jr.key(0), (100, 2), minval=-1.0, maxval=1.0)
 y_train = f(x_train)
 
 
-# train models with different regularization strengths
 models = []
 regularizations = list(10 ** jnp.linspace(0, 4, 20))[::-1]
 for i, l in enumerate(regularizations):
@@ -35,16 +37,17 @@ for i, l in enumerate(regularizations):
         l1_penalty=l,
         max_iterations=1000,
         tollerance=1e-4,
+        multi_init=10,
         jitter=True,
-        warm_start_theta=models[-1].parameters.theta if models else None,
+        theta_min=models[-1].parameters.theta if models else None,
     )
     model.fit(x=x_train, y=y_train)
     models.append(model)
 
     # visualize the loss surface and ADMM trajectory
-    xs = jnp.array([x for x, z, u, rho in model.trajectory])
-    zs = jnp.array([z for x, z, u, rho in model.trajectory])
-    us = jnp.array([u for x, z, u, rho in model.trajectory])
+    xs = jnp.array([x[..., :2] for x, z, u, rho in model.trajectory])
+    zs = jnp.array([z[..., :2] for x, z, u, rho in model.trajectory])
+    us = jnp.array([u[..., :2] for x, z, u, rho in model.trajectory])
     lims = (min(xs.min(), zs.min() - 0.01), max(xs.max(), zs.max()) + 0.01)
     t1 = jnp.linspace(*lims, 50)
     t2 = jnp.linspace(*lims, 50)
@@ -61,8 +64,8 @@ for i, l in enumerate(regularizations):
     plt.grid()
 
     # plot the ADMM trajectory
-    plt.plot(*xs[:, 0, :2].T, marker="*", color="green", label="x path", alpha=0.5)
-    plt.plot(*zs[:, 0, :2].T, marker="*", color="blue", label="z path", alpha=0.5)
+    plt.plot(*xs[:, 0].T, marker="*", color="green", label="x path", alpha=0.5)
+    plt.plot(*zs[:, 0].T, marker="*", color="blue", label="z path", alpha=0.5)
 
     # plot the minimum and learned parameters
     plt.plot(*theta[jnp.argmin(z)], marker="o", color="white", label="minimum")
@@ -80,7 +83,6 @@ preds = [model.predict(x=x_test) for model in models]
 r2 = np.array([r2_score(y_true=y_test[:, 0], y_pred=pred.mean[0]) for pred in preds])
 thetas = np.array([model.parameters.theta[0] for model in models])
 gs = np.array([model.parameters.g[0] for model in models])
-
 regularizations = [r for r in regularizations]
 
 plt.figure(figsize=(10, 8))
@@ -94,7 +96,6 @@ plt.legend()
 plt.grid()
 plt.subplot(2, 1, 2)
 plt.plot(regularizations, thetas, marker="o", label="lengthscale")
-# plt.plot(regularizations, gs, marker="o", label="nugget", color="black", alpha=0.1)
 plt.xscale("log")
 plt.xlabel("Regularization lambda")
 plt.ylabel("Learned lengthscale")

@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.random as jr
 from jax.numpy.linalg import norm
+from einops import rearrange
 
 import numpy as np
 import scipy
@@ -89,7 +90,7 @@ def admm_x_update(
     rho: float,
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n o"],
-    bounds: list[tuple[float, float]],
+    bounds: Float[Array, "2 o d+1"],
     maxiter: int = 10,
     jitter_key: Key | None = None,
 ) -> Float[Array, "o d+1"]:
@@ -100,7 +101,7 @@ def admm_x_update(
             args=(admm_z[i], admm_u[i], rho, x_train, y_train[:, i]),
             jac=True,
             method="L-BFGS-B",
-            bounds=bounds,
+            bounds=[(a, b) for a, b in zip(*bounds[:, i])],
             options=dict(maxiter=maxiter, ftol=EPS, gtol=0),
         )
         for i in range(admm_x.shape[0])
@@ -119,6 +120,7 @@ def admm_z_update(
     admm_u: Float[Array, "o d+1"],
     rho: float,
     l1_penalty: float,
+    bounds: Float[Array, "2 o d+1"],
 ) -> Float[Array, "o 3d+1"]:
     theta = (admm_x + admm_u)[:, :-1]
     g = (admm_x + admm_u)[:, -1]
@@ -130,7 +132,8 @@ def admm_z_update(
 
     new_z = admm_z.at[:, :-1].set(theta)
     new_z = new_z.at[:, -1].set(g)  # no regularization on g
-    return new_z
+
+    return new_z.clip(*bounds)  # project back to bounds)
 
 
 def hetgpy_auto_bounds(x, min_cor=0.01, max_cor=0.5):
@@ -160,12 +163,14 @@ class Parameters(NamedTuple):
 
 @dataclass
 class GaussianProcessRegressor:
-    l1_penalty: float
+    l1_penalty: float = 0.0
     max_iterations: int = 1000
     tollerance: float = 1e-4
     jitter: bool = True
-    warm_start_theta: Optional[Float[Array, "o d"]] = None
-    warm_start_g: Optional[Float[Array, "o"]] = None
+    multi_init: int = 10
+    seed: int = 42
+    theta_min: Optional[Float[Array, "o d"]] = None
+    theta_max: Optional[Float[Array, "o d"]] = None
 
     # params to fit after training
     parameters: Parameters = field(init=False)
@@ -177,10 +182,10 @@ class GaussianProcessRegressor:
         x0: Float[Array, "o d+1"],
         x_train: Float[Array, "n d"],
         y_train: Float[Array, "n o"],
-        bounds: list[tuple[float, float]],
+        bounds: Float[Array, "2 o d+1"],
     ):
         admm_x = x0
-        admm_z = x0
+        admm_z = jnp.maximum(0.0, bounds[0])
         admm_u = jnp.zeros_like(x0)
         rho = 1.0
 
@@ -190,7 +195,9 @@ class GaussianProcessRegressor:
             new_admm_x = admm_x_update(
                 admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, jitter_key=k
             )
-            new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, self.l1_penalty)
+            new_admm_z = admm_z_update(
+                new_admm_x, admm_z, admm_u, rho, self.l1_penalty, bounds
+            )
             new_admm_u = admm_u + new_admm_x - new_admm_z
 
             # check convergence
@@ -225,34 +232,42 @@ class GaussianProcessRegressor:
 
         # initialization and bounds
         lower, upper = hetgpy_auto_bounds(x)
-        bounds = [(1 / u**0.5, 1 / l**0.5) for l, u in zip(lower, upper)] + [(EPS, 1e2)]
-        if self.l1_penalty > EPS:  # allow for l1 to do its job
-            bounds = [(0.0, u) for l, u in bounds[:-1]] + [bounds[-1]]
+        # init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
+        # init_g = jnp.array([jnp.log(1e-1)] * o)
 
-        init_theta = jnp.tile(0.5 * 1 / (lower) ** 0.5, (o, 1))
-        init_g = jnp.array([0.1] * o)
-
-        # initialize admm state
-        if self.warm_start_theta is not None:
-            init_theta = self.warm_start_theta
-        if self.warm_start_g is not None:
-            init_g = self.warm_start_g
+        g_bounds = jnp.array([EPS, 1e2])
+        theta_bounds = jnp.array([1 / upper**0.5, 1 / lower**0.5])
+        bounds = jnp.concat([theta_bounds, g_bounds[:, None]], axis=-1)
+        bounds = jnp.tile(bounds[:, None, :], (1, o, 1))
+        if self.l1_penalty > EPS:  # set lower bound to 0 for theta
+            bounds = bounds.at[0, ..., :-1].set(0.0)
+        if self.theta_min is not None:
+            bounds = bounds.at[0, ..., :-1].set(self.theta_min)
+        if self.theta_max is not None:
+            bounds = bounds.at[1, ..., :-1].set(self.theta_max)
+       
 
         results = []
-        for g in 10 ** jnp.linspace(-2, 0, 100):
-            init_g = jnp.array([g] * o)
-            x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=1)
+        for key in jr.split(jr.key(self.seed), self.multi_init or 1):
+            # sample uniformly inside the bounds for better exploration
+            # use warm start to set minimum of the bounds
+            x0 = jr.uniform(key, (o, d + 1), minval=bounds[0], maxval=bounds[1])
+            x0 = x0.at[..., -1].set(0.1)  # keep standard init for g
             trajectory = self.admm(x0, x_train=x, y_train=y, bounds=bounds)
 
             # extract the optimal parameters and infer the rest
             admm_x = trajectory[-1][0]
             theta = admm_x[:, :-1]
             g = admm_x[:, -1]
-            ll, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
-            results.append((ll, trajectory, theta, g, b, nu))
+            llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
+
+            #theta = rearrange(theta, "o (d k) -> (o k) d", k=3)  # group by sensor
+            l1 = self.l1_penalty * norm(theta, axis=0).sum()
+            #theta = rearrange(theta, "(o k) d -> o (d k)", k=3)  # back to original shape
+            results.append((-llk.sum() + l1, trajectory, theta, g, b, nu))
 
         # get the best result across different initializations
-        ll, trajectory, theta, g, b, nu = max(results, key=lambda r: r[0])
+        ll, trajectory, theta, g, b, nu = min(results, key=lambda r: r[0])
 
         # save stuff
         self.trajectory = trajectory
