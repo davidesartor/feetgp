@@ -97,16 +97,17 @@ def admm_x_update(
     new_x = [
         scipy.optimize.minimize(
             fun=admm_x_update_loss,
-            x0=admm_x[i],
-            args=(admm_z[i], admm_u[i], rho, x_train, y_train[:, i]),
+            x0=x,
+            args=(z, u, rho, x_train, y),
             jac=True,
             method="L-BFGS-B",
-            bounds=[(a, b) for a, b in zip(*bounds[:, i])],
+            bounds=[(a, b) for a, b in zip(b_min, b_max)],
             options=dict(maxiter=maxiter, ftol=EPS, gtol=0),
+        )["x"]
+        for x, z, u, y, b_min, b_max in zip(
+            admm_x, admm_z, admm_u, y_train.T, bounds[0], bounds[1]
         )
-        for i in range(admm_x.shape[0])
     ]
-    new_x = [opt["x"] for opt in new_x]
     new_x = jnp.stack(new_x, axis=0)
     if jitter_key is not None:  # add noise to escape local minima
         new_x = new_x * (1 + 1e-3 * jr.normal(jitter_key, new_x.shape))
@@ -125,15 +126,65 @@ def admm_z_update(
     theta = (admm_x + admm_u)[:, :-1]
     g = (admm_x + admm_u)[:, -1]
 
-    # theta = rearrange(theta, "o (d k) -> (o k) d", k=3)  # group by sensor
+    theta = rearrange(theta, "o (d k) -> (o k) d", k=3)  # group by sensor
     prox = jnp.maximum(0, 1 - (l1_penalty / rho) / norm(theta, axis=0))
     theta = prox * theta
-    # theta = rearrange(theta, "(o k) d -> o (d k)", k=3)  # back to original shape
+    theta = rearrange(theta, "(o k) d -> o (d k)", k=3)  # back to original shape
 
     new_z = admm_z.at[:, :-1].set(theta)
     new_z = new_z.at[:, -1].set(g)  # no regularization on g
 
     return new_z.clip(*bounds)  # project back to bounds)
+
+
+def admm(
+    x0: Float[Array, "o d+1"],
+    x_train: Float[Array, "n d"],
+    y_train: Float[Array, "n o"],
+    bounds: Float[Array, "2 o d+1"],
+    l1_penalty: float,
+    max_iterations: int,
+    tollerance: float,
+    jitter: bool,
+):
+    admm_x = x0
+    admm_z = jnp.maximum(0.0, bounds[0])
+    admm_u = jnp.zeros_like(x0)
+    rho = float(l1_penalty + EPS)  # start with a reasonable rho
+
+    trajectory = [(admm_x, admm_z, admm_u, rho)]
+    for iter in tqdm(range(max_iterations), desc="ADMM iterations"):
+        k = jr.key(iter) if jitter else None
+        new_admm_x = admm_x_update(
+            admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, jitter_key=k
+        )
+        new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, l1_penalty, bounds)
+        new_admm_u = admm_u + new_admm_x - new_admm_z
+
+        # check convergence
+        primal_residual = norm(new_admm_x - new_admm_z, axis=-1)
+        dual_residual = rho * norm(new_admm_z - admm_z, axis=-1)
+        primal_ok = primal_residual < EPS + tollerance * jnp.maximum(
+            norm(admm_x, axis=-1), norm(admm_z, axis=-1)
+        )
+        dual_ok = dual_residual < EPS + tollerance * rho * norm(admm_u, axis=-1)
+
+        # update rho to balance primal and dual residuals
+        if primal_residual.sum() > 10 * dual_residual.sum():
+            rho = 2 * rho
+            new_admm_u = new_admm_u / 2
+        elif dual_residual.sum() > 10 * primal_residual.sum():
+            rho = rho / 2
+            new_admm_u = new_admm_u * 2
+
+        # update state and possibly early stop
+        admm_x, admm_z, admm_u = new_admm_x, new_admm_z, new_admm_u
+        trajectory.append((admm_x, admm_z, admm_u, rho))
+        if primal_ok.all() and dual_ok.all():
+            break
+    else:
+        print("ADMM did not converge within the maximum number of iterations.")
+    return trajectory
 
 
 def hetgpy_auto_bounds(x, min_cor=0.01, max_cor=0.5):
@@ -177,55 +228,6 @@ class GaussianProcessRegressor:
     x: Float[Array, "n d"] = field(init=False)
     y: Float[Array, "n o"] = field(init=False)
 
-    def admm(
-        self,
-        x0: Float[Array, "o d+1"],
-        x_train: Float[Array, "n d"],
-        y_train: Float[Array, "n o"],
-        bounds: Float[Array, "2 o d+1"],
-    ):
-        admm_x = x0
-        admm_z = jnp.maximum(0.0, bounds[0])
-        admm_u = jnp.zeros_like(x0)
-        rho = 1.0
-
-        trajectory = [(admm_x, admm_z, admm_u, rho)]
-        for iter in tqdm(range(self.max_iterations), desc="ADMM iterations"):
-            k = jr.key(iter) if self.jitter else None
-            new_admm_x = admm_x_update(
-                admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, jitter_key=k
-            )
-            new_admm_z = admm_z_update(
-                new_admm_x, admm_z, admm_u, rho, self.l1_penalty, bounds
-            )
-            new_admm_u = admm_u + new_admm_x - new_admm_z
-
-            # check convergence
-            primal_residual = norm(new_admm_x - new_admm_z, axis=-1)
-            dual_residual = rho * norm(new_admm_z - admm_z, axis=-1)
-            tol = self.tollerance
-            primal_ok = primal_residual < EPS + self.tollerance * jnp.maximum(
-                norm(admm_x, axis=-1), norm(admm_z, axis=-1)
-            )
-            dual_ok = dual_residual < EPS + tol * rho * norm(admm_u, axis=-1)
-
-            # update rho to balance primal and dual residuals
-            if primal_residual.sum() > 10 * dual_residual.sum():
-                rho = 2 * rho
-                new_admm_u = new_admm_u / 2
-            elif dual_residual.sum() > 10 * primal_residual.sum():
-                rho = rho / 2
-                new_admm_u = new_admm_u * 2
-
-            # update state and possibly early stop
-            admm_x, admm_z, admm_u = new_admm_x, new_admm_z, new_admm_u
-            trajectory.append((admm_x, admm_z, admm_u, rho))
-            if primal_ok.all() and dual_ok.all():
-                break
-        else:
-            print("ADMM did not converge within the maximum number of iterations.")
-        return trajectory
-
     def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"]):
         n, d = x.shape
         n, o = y.shape
@@ -245,7 +247,6 @@ class GaussianProcessRegressor:
             bounds = bounds.at[0, ..., :-1].set(self.theta_min)
         if self.theta_max is not None:
             bounds = bounds.at[1, ..., :-1].set(self.theta_max)
-       
 
         results = []
         for key in jr.split(jr.key(self.seed), self.multi_init or 1):
@@ -253,7 +254,17 @@ class GaussianProcessRegressor:
             # use warm start to set minimum of the bounds
             x0 = jr.uniform(key, (o, d + 1), minval=bounds[0], maxval=bounds[1])
             x0 = x0.at[..., -1].set(0.1)  # keep standard init for g
-            trajectory = self.admm(x0, x_train=x, y_train=y, bounds=bounds)
+
+            trajectory = admm(
+                x0,
+                x_train=x,
+                y_train=y,
+                bounds=bounds,
+                l1_penalty=self.l1_penalty,
+                max_iterations=self.max_iterations,
+                tollerance=self.tollerance,
+                jitter=self.jitter,
+            )
 
             # extract the optimal parameters and infer the rest
             admm_x = trajectory[-1][0]
@@ -261,9 +272,11 @@ class GaussianProcessRegressor:
             g = admm_x[:, -1]
             llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
 
-            #theta = rearrange(theta, "o (d k) -> (o k) d", k=3)  # group by sensor
+            theta = rearrange(theta, "o (d k) -> (o k) d", k=3)  # group by sensor
             l1 = self.l1_penalty * norm(theta, axis=0).sum()
-            #theta = rearrange(theta, "(o k) d -> o (d k)", k=3)  # back to original shape
+            theta = rearrange(
+                theta, "(o k) d -> o (d k)", k=3
+            )  # back to original shape
             results.append((-llk.sum() + l1, trajectory, theta, g, b, nu))
 
         # get the best result across different initializations

@@ -1,16 +1,19 @@
-import pandas as pd
-import numpy as np
-
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.random as jr
 
+import os
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 import gp
 
+
 jax.config.update("jax_enable_x64", True)
+os.makedirs("figures", exist_ok=True)
+os.makedirs("models", exist_ok=True)
 
 
 # load and preprocess data
@@ -35,19 +38,20 @@ y_train, y_test = x[::2], x[1::2]
 print("train:", x_train.shape, y_train.shape)
 print("test:", x_test.shape, y_test.shape)
 n, d = x_train.shape
+n, o = y_train.shape
 
 
 # train models with different regularization strengths
 models = []
-penalties = list(10 ** jnp.linspace(0, 6, 20))[::-1]
+penalties = list(10 ** jnp.linspace(0, 6, 10))[::-1]
 for i, l in enumerate(penalties):
     model = gp.GaussianProcessRegressor(
         l1_penalty=l,
-        max_iterations=1000,
-        tollerance=1e-4,
-        jitter=True,
-        # warm_start_theta=models[-1].parameters.theta if models else None,
-        # warm_start_g=models[-1].parameters.g if models else None,
+        max_iterations=100,
+        tollerance=1e-3,
+        multi_init=20,
+        #jitter=True,
+        #theta_min=models[-1].parameters.theta if models else None,
     )
     model.fit(x=x_train, y=y_train)
     models.append(model)
@@ -64,7 +68,7 @@ for i, l in enumerate(penalties):
     # reshape stuff
     r2 = np.array(r2).clip(min=1e-4)  # avoid log(0) in plot
 
-    thetas = thetas.reshape(-1, d, d // 3, 3)
+    thetas = thetas.reshape(-1, o, d // 3, 3)
     thetas_avg = thetas.mean(-1).mean(-2)  # average over same marker
     thetas_max = thetas.max(-1).max(-2)  # max over same marker
     thetas_min = thetas.min(-1).min(-2)  # min over same marker
@@ -98,6 +102,7 @@ for i, l in enumerate(penalties):
             penalties[: i + 1], thetas_min[:, j], thetas_max[:, j], alpha=0.1
         )
     plt.xscale("log")
+    plt.yscale("log")
     plt.xlabel("Regularization lambda")
     plt.ylabel("Learned lengthscale")
     plt.title("Effect of regularization on learned lengthscale")
