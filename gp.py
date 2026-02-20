@@ -87,7 +87,6 @@ def admm_x_update(
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n o"],
     bounds: Float[Array, "2 o d+1"],
-    jitter_key: Optional[Key] = None,
 ) -> Float[Array, "o d+1"]:
     new_x = [
         scipy.optimize.minimize(
@@ -102,12 +101,7 @@ def admm_x_update(
         for x, z, u, y, bmin, bmax in zip(admm_x, admm_z, admm_u, y_train.T, *bounds)
     ]
     new_x = jnp.stack(new_x, axis=0)
-    if jitter_key is not None:
-        # add absolute noise only to the theta part
-        # adding it to g destibilizes the optimization
-        noise = 1e-3 * jr.normal(jitter_key, shape=new_x[..., :-1].shape)
-        new_x = new_x.at[..., :-1].add(noise)
-    return new_x.clip(*bounds)
+    return new_x
 
 
 @jax.jit
@@ -136,8 +130,6 @@ def admm(
     l1_penalty: float,
     max_iterations: int,
     tollerance: float,
-    jitter: bool = False,
-    seed: int = 42,
 ):
     admm_x = x0
     admm_z = x0
@@ -145,12 +137,9 @@ def admm(
     rho = 1.0
 
     trajectory = [(admm_x, admm_z, admm_u, rho)]
-    for iter, rng_key in enumerate(
-        pbar := tqdm(jr.split(jr.key(seed), max_iterations), desc="ADMM")
-    ):
-        jitter_key = rng_key if jitter else None
+    for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
         new_admm_x = admm_x_update(
-            admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, jitter_key
+            admm_x, admm_z, admm_u, rho, x_train, y_train, bounds
         )
         new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, l1_penalty, bounds)
         new_admm_u = admm_u + new_admm_x - new_admm_z
@@ -218,7 +207,6 @@ class GaussianProcessRegressor:
     max_iterations: int = 1000
     tollerance: float = 1e-4
     multi_start: int = 1
-    jitter: bool = True
     seed: int = 42
     verbose: bool = False
     init_theta: Optional[Float[Array, "o d"]] = None
@@ -289,8 +277,6 @@ class GaussianProcessRegressor:
                 l1_penalty=self.l1_penalty,
                 max_iterations=self.max_iterations,
                 tollerance=self.tollerance,
-                jitter=self.jitter,
-                seed=self.seed,
             )
 
             # extract the optimal parameters and infer the rest

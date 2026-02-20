@@ -109,3 +109,14 @@ Of course the opposite can also be true. Overall it should have a slight positiv
 For this reason I think is best to avoid this when doing multi start optimisation. 
 
 > Here the default behaviour is for _jitter=True_ to show the effects of this option, but I will remove it entirely in the next examples.
+
+# Test 3
+
+## Sanity check on real data
+
+Just a sanity check that everything we have so far doesn't break when using the real sensor data.
+_test3.py_ is another mock test that tries to reconstruct just a subset of the inputs.
+Everything seems to be working as expected here.
+
+
+
