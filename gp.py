@@ -87,7 +87,7 @@ def admm_x_update(
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n o"],
     bounds: Float[Array, "2 o d+1"],
-    max_iterations: int,
+    jitter_key: Optional[Key] = None,
 ) -> Float[Array, "o d+1"]:
     new_x = [
         scipy.optimize.minimize(
@@ -97,12 +97,17 @@ def admm_x_update(
             jac=True,
             method="L-BFGS-B",
             bounds=[(a, b) for a, b in zip(bmin, bmax)],
-            options=dict(maxiter=max_iterations, ftol=EPS, gtol=0),
+            options=dict(maxiter=10, ftol=EPS, gtol=0),
         ).x
         for x, z, u, y, bmin, bmax in zip(admm_x, admm_z, admm_u, y_train.T, *bounds)
     ]
     new_x = jnp.stack(new_x, axis=0)
-    return new_x
+    if jitter_key is not None:
+        # add absolute noise only to the theta part
+        # adding it to g destibilizes the optimization
+        noise = 1e-3 * jr.normal(jitter_key, shape=new_x[..., :-1].shape)
+        new_x = new_x.at[..., :-1].add(noise)
+    return new_x.clip(*bounds)
 
 
 @jax.jit
@@ -120,7 +125,7 @@ def admm_z_update(
     theta = prox * theta
     new_z = admm_z.at[:, :-1].set(theta)
     new_z = new_z.at[:, -1].set(g)  # no regularization on g
-    return new_z.clip(*bounds)  # project back to bounds)
+    return new_z.clip(*bounds)  # in case bounds do not include 0
 
 
 def admm(
@@ -129,9 +134,10 @@ def admm(
     y_train: Float[Array, "n o"],
     bounds: Float[Array, "2 o d+1"],
     l1_penalty: float,
-    max_admm_iterations: int,
-    max_bfgs_iterations: int,
+    max_iterations: int,
     tollerance: float,
+    jitter: bool = False,
+    seed: int = 42,
 ):
     admm_x = x0
     admm_z = x0
@@ -139,9 +145,12 @@ def admm(
     rho = 1.0
 
     trajectory = [(admm_x, admm_z, admm_u, rho)]
-    for iter in (pbar := tqdm(range(max_admm_iterations), desc="ADMM")):
+    for iter, rng_key in enumerate(
+        pbar := tqdm(jr.split(jr.key(seed), max_iterations), desc="ADMM")
+    ):
+        jitter_key = rng_key if jitter else None
         new_admm_x = admm_x_update(
-            admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, max_bfgs_iterations
+            admm_x, admm_z, admm_u, rho, x_train, y_train, bounds, jitter_key
         )
         new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, l1_penalty, bounds)
         new_admm_u = admm_u + new_admm_x - new_admm_z
@@ -206,9 +215,11 @@ class Parameters(NamedTuple):
 @dataclass
 class GaussianProcessRegressor:
     l1_penalty: float
-    max_admm_iterations: int = 1000
-    max_bfgs_iterations: int = 10
+    max_iterations: int = 1000
     tollerance: float = 1e-4
+    multi_start: int = 1
+    jitter: bool = True
+    seed: int = 42
     verbose: bool = False
     init_theta: Optional[Float[Array, "o d"]] = None
     init_g: Optional[Float[Array, "o"]] = None
@@ -234,7 +245,6 @@ class GaussianProcessRegressor:
             init_theta = self.init_theta
         if self.init_g is not None:
             init_g = self.init_g
-        x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=-1)
         if self.verbose:
             print(f"Initial theta: {init_theta}")
             print(f"Initial g: {init_g}")
@@ -246,7 +256,8 @@ class GaussianProcessRegressor:
         g_bounds = jnp.array([EPS, 1e2])
         bounds = jnp.concat([theta_bounds, g_bounds[:, None]], axis=-1)
         bounds = jnp.tile(bounds[:, None, :], (1, o, 1))
-        self.bounds = bounds.at[0, ..., :-1].set(0.0)
+        bounds = bounds.at[0, ..., :-1].set(0.0)
+        self.bounds = bounds
         if self.verbose:
             print(f"Bounds for theta:")
             print(f"Min: {self.bounds[0, ..., :-1]}")
@@ -256,30 +267,49 @@ class GaussianProcessRegressor:
             print(f"Max: {self.bounds[1, ..., -1]}")
             print()
 
-        # run admm
-        trajectory = admm(
-            x0=x0,
-            x_train=x,
-            y_train=y,
-            bounds=self.bounds,
-            l1_penalty=self.l1_penalty,
-            max_admm_iterations=self.max_admm_iterations,
-            max_bfgs_iterations=self.max_bfgs_iterations,
-            tollerance=self.tollerance,
-        )
+        results = []
+        for rng_key in jr.split(jr.key(self.seed), self.multi_start):
+            # get a random init point
+            rng_a, rng_b = jr.split(rng_key)
+            a = jr.uniform(rng_a)
+            init_theta = a * init_theta + (1 - a) * jr.uniform(
+                rng_b,
+                init_theta.shape,
+                minval=bounds[0, ..., :-1],
+                maxval=bounds[1, ..., :-1],
+            )
+            x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=-1)
 
-        # extract the optimal parameters and infer the rest
-        admm_x, admm_z, admm_u, rho = trajectory[-1]
-        theta = admm_x[:, :-1]
-        g = admm_x[:, -1]
-        llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
-        if self.verbose:
-            print(f"Optimal theta: {theta}")
-            print(f"Optimal g: {g}")
-            print(f"Optimal b: {b}")
-            print(f"Optimal nu: {nu}")
-            print(f"Log-likelihood at optimum: {llk}")
-            print()
+            # run admm
+            trajectory = admm(
+                x0=x0,
+                x_train=x,
+                y_train=y,
+                bounds=self.bounds,
+                l1_penalty=self.l1_penalty,
+                max_iterations=self.max_iterations,
+                tollerance=self.tollerance,
+                jitter=self.jitter,
+                seed=self.seed,
+            )
+
+            # extract the optimal parameters and infer the rest
+            admm_x, admm_z, admm_u, rho = trajectory[-1]
+            theta = admm_x[:, :-1]
+            g = admm_x[:, -1]
+            llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
+            loss = -llk.sum() + self.l1_penalty * jnp.sum(norm(theta, axis=0))
+            results.append((loss, trajectory, theta, g, b, nu))
+            if self.verbose:
+                print(f"Optimal theta: {theta}")
+                print(f"Optimal g: {g}")
+                print(f"Optimal b: {b}")
+                print(f"Optimal nu: {nu}")
+                print(f"Log-likelihood at optimum: {llk}")
+                print()
+
+        # best result (minimum loss) across the multiple random restarts
+        trajectory, theta, g, b, nu = min(results, key=lambda x: x[0])[1:]
 
         # save stuff
         self.trajectory = trajectory

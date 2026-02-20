@@ -49,7 +49,7 @@ So the optimization loop becomes a series of L-BFGS-B calls each solving the mle
 
 >open optimization_trajectoty.html to see the results of running admm on the unregularized problem
 
-In the plots, I'm showing the admm loss heatmap for theta, given the nugett found after each step. 
+In the plots, I'm showing the admm loss heatmap for $theta$, given the nugett found after each step. 
 The optimization gets trapped in a local minima.
 I did not create this example on purpose to show this. Apparently this is very likely to happen. 
 Before diagnosing the source of the problem, I was playing around with different variations of simple examples functions, and all ended up having the same issue of getting trapped in local minimas following hetgpy initialization.
@@ -78,3 +78,34 @@ This effect gets more pronounced for large values of $g$.
 
 > The saved files _optimization_trajectory_*.html_ show the results of this (use log scale to highlight the effect)
 
+
+# Test 2
+
+## Multi start initialization 
+
+An easy fix (for this simple example at least) is to just use multi-start optimization. In this case there are only 2 basins of attractions so even just a small number of random initialization is likely to find the true global minima.
+Doing this fixes the problem here but there are just a few important details I should mention:
+Initalizing uniformly in the domain also works here, but then we completely lose the ability to have some kind of warm start.
+What seems to work well here (and looks like a good compromise to me) is to do a random linear interpolation between the two.
+That is, we use the initialization point
+$$
+a x_0 + (1-a) u \\
+a \sim U(0,1)
+u \sim U(x_{min}, x_{max})
+$$
+where $x_0$ is the desired initialization. This could be either the hetgpy initialization or a warm start as in the previous examples.
+So we are still sampling the entire domain, but with a bias towards the desired region.
+
+> By seeding the sampling, we can ensure that different models use the same "anchors" $u$. I'm sill thorn on if this is a desirable property to enforce or no. Play around with the _seed_ argument in the constructor. By default it is the same for all models (42).
+
+The default initialization for $g=0.1$ is very good (at least in this example). Having a random init on the nugget also works if it is done in log-scale. Overall very large values are extremely detremental for the optimization as they push $\theta$ to zero immediately (see interactive plot of loss landscape of test0). Similarly, values close to zero can also lead to poor optimization when there is noise in the observations. In this example this is not the case and smaller nuggets also work.
+
+>The default behaviour I ended up going with is add noise in the initialization only to $\theta$ leaving $g$ untouched.
+
+## Adding jitter
+
+Adding some noise in the admm x update can also be beneficial. This can allow the trajectory to escape a suboptimal basing of attraction. In fact, for some seeds, adding jitter is enough to find the correct solution.
+Of course the opposite can also be true. Overall it should have a slight positive impact on the result but could require a lot more iterations before an early stop is triggered.
+For this reason I think is best to avoid this when doing multi start optimisation. 
+
+> Here the default behaviour is for _jitter=True_ to show the effects of this option, but I will remove it entirely in the next examples.
