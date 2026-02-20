@@ -210,6 +210,8 @@ class GaussianProcessRegressor:
     max_bfgs_iterations: int = 10
     tollerance: float = 1e-4
     verbose: bool = False
+    init_theta: Optional[Float[Array, "o d"]] = None
+    init_g: Optional[Float[Array, "o"]] = None
 
     # params to fit after training
     parameters: Parameters = field(init=False)
@@ -228,6 +230,10 @@ class GaussianProcessRegressor:
         lower, upper = hetgpy_auto_bounds(x)
         init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
         init_g = jnp.array([0.1] * o)
+        if self.init_theta is not None:
+            init_theta = self.init_theta
+        if self.init_g is not None:
+            init_g = self.init_g
         x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=-1)
         if self.verbose:
             print(f"Initial theta: {init_theta}")
