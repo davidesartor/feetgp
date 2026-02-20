@@ -119,4 +119,13 @@ _test3.py_ is another mock test that tries to reconstruct just a subset of the i
 Everything seems to be working as expected here.
 
 
+# Test 4
+
+## Handling Group Lasso for Markers
+
+In the previous test group lasso was applied component wise. The last missing step is to apply the penalty considering that the x,y,z components of each marker should also be in the same group.
+
+> Here I'm taking every other sample as test set instaead of using first and second half of the trajectory to eliminate the distribution shift as a counfounding factor.
+
+
 

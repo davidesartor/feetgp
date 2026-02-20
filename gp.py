@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.random as jr
 from jax.numpy.linalg import norm
+from einops import rearrange
 import scipy
 from tqdm import tqdm
 
@@ -115,8 +116,10 @@ def admm_z_update(
 ) -> Float[Array, "o d+1"]:
     theta = (admm_x + admm_u)[:, :-1]
     g = (admm_x + admm_u)[:, -1]
+    theta = rearrange(theta, "o (d k) -> (o k) d", k=3)
     prox = jnp.maximum(0, 1 - (l1_penalty / rho / norm(theta, axis=0)))
     theta = prox * theta
+    theta = rearrange(theta, "(o k) d -> o (d k)", k=3)
     new_z = admm_z.at[:, :-1].set(theta)
     new_z = new_z.at[:, -1].set(g)  # no regularization on g
     return new_z.clip(*bounds)  # in case bounds do not include 0
@@ -284,7 +287,8 @@ class GaussianProcessRegressor:
             theta = admm_x[:, :-1]
             g = admm_x[:, -1]
             llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
-            loss = -llk.sum() + self.l1_penalty * jnp.sum(norm(theta, axis=0))
+            glasso = jnp.sum(norm(rearrange(theta, "o (d k) -> (o k) d", k=3), axis=0))
+            loss = -llk.sum() + self.l1_penalty * glasso
             results.append((loss, trajectory, theta, g, b, nu))
             if self.verbose:
                 print(f"Optimal theta: {theta}")
