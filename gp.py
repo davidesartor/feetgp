@@ -169,6 +169,7 @@ def admm(
         admm_u = jnp.zeros_like(x0)
     else:
         admm_u = u0
+    print("don't forget rho init!")
     #rho = 1.0
     #print("rho is diff!")
     #rho = 1e5
@@ -247,13 +248,15 @@ class Parameters(NamedTuple):
 
 @dataclass
 class GaussianProcessRegressor:
-    l1_penalty: float
+    #l1_penalty: float
     max_iterations: int = 1000
     tollerance: float = 1e-4
     seed: int = 42
     verbose: bool = False
-    init_theta: Optional[Float[Array, "o d"]] = None
-    init_g: Optional[Float[Array, "o"]] = None
+    warmstart: bool = True
+    warmzu: bool = False
+    #init_theta: Optional[Float[Array, "o d"]] = None
+    #init_g: Optional[Float[Array, "o"]] = None
 
     # params to fit after training
     parameters: Parameters = field(init=False)
@@ -262,7 +265,12 @@ class GaussianProcessRegressor:
     trajectory: list = field(init=False)
     bounds: Float[Array, "2 o d"] = field(init=False)
 
-    def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"], method ='admm'):
+    # to save last part of optim trajectory.
+    last_x: Float[Array, "o d+1"] | None = field(default=None)
+    last_z: Float[Array, "o d+1"] | None = field(default=None)
+    last_u: Float[Array, "o d+1"] | None = field(default=None)
+
+    def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"], l1_penalty: float, method ='admm'):
         n, d = x.shape
         n, o = y.shape
 
@@ -272,10 +280,10 @@ class GaussianProcessRegressor:
         lower, upper = hetgpy_auto_bounds(x)
         init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
         init_g = jnp.array([0.1] * o)
-        if self.init_theta is not None:
-            init_theta = self.init_theta
-        if self.init_g is not None:
-            init_g = self.init_g
+        #if self.init_theta is not None:
+        #    init_theta = self.init_theta
+        #if self.init_g is not None:
+        #    init_g = self.init_g
         if self.verbose:
             print(f"Initial theta: {init_theta}")
             print(f"Initial g: {init_g}")
@@ -299,7 +307,18 @@ class GaussianProcessRegressor:
             print()
 
         results = []
-        x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=-1)
+        if self.last_x is None or not self.warmstart:
+            x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=-1)
+        else:
+            x0 = self.last_x
+        if self.warmstart and self.warmzu and self.last_z is not None:
+            z0 = self.last_z
+        else:
+            z0 = None
+        if self.warmstart and self.warmzu and self.last_u is not None:
+            u0 = self.last_u
+        else:
+            u0 = None
 
         # run admm
         if method=='admm':
@@ -307,8 +326,10 @@ class GaussianProcessRegressor:
                 x_train=x,
                 y_train=y,
                 bounds=self.bounds,
-                l1_penalty=self.l1_penalty,
+                l1_penalty=l1_penalty,
                 x0=x0,
+                z0=z0,
+                u0=u0,
                 max_iterations=self.max_iterations,
                 tollerance=self.tollerance,
             )
@@ -375,7 +396,7 @@ class GaussianProcessRegressor:
                 # GD step.
                 cost, (theta_grad, g_grad) = total_nll(theta, g, x_use, y)
                 theta = theta - lr_theta*theta_grad
-                theta = prox_l1(theta, self.l1_penalty * lr_theta)
+                theta = prox_l1(theta, l1_penalty * lr_theta)
                 #g = g - lr_g*g_grad
 
                 # Projection
@@ -383,7 +404,7 @@ class GaussianProcessRegressor:
                 theta = theta.clip(*bounds[:,:,:-1])
                 #g = g.clip(*bounds[:,:,-1:])
 
-                pen = self.l1_penalty*jnp.sum(jnp.sqrt(jnp.sum(jnp.square(theta),axis=0)))
+                pen = l1_penalty*jnp.sum(jnp.sqrt(jnp.sum(jnp.square(theta),axis=0)))
                 costs_f = costs_f.at[i].set(cost)
                 costs_g = costs_g.at[i].set(pen)
                 costs = costs.at[i].set(cost+pen)
@@ -416,18 +437,20 @@ class GaussianProcessRegressor:
             plt.title("g")
             plt.savefig('pgd.pdf')
             plt.close()
-
-
         else:
             raise Exception('Unknown method in fit.')
 
         # extract the optimal parameters and infer the rest
         admm_x, admm_z, admm_u, rho = trajectory[-1]
+        self.last_x = jnp.copy(admm_x)
+        self.last_z = jnp.copy(admm_z)
+        self.last_u = jnp.copy(admm_u)
+
         theta = admm_x[:, :-1]
         g = admm_x[:, -1]
         llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
         glasso = jnp.sum(norm(rearrange(theta, "o (d k) -> (o k) d", k=3), axis=0))
-        loss = -llk.sum() + self.l1_penalty * glasso
+        loss = -llk.sum() + l1_penalty * glasso
         results.append((loss, trajectory, theta, g, b, nu))
         if self.verbose:
             print(f"Optimal theta: {theta}")

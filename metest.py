@@ -96,17 +96,17 @@ print("Train points shape:", x_train.shape)  # (N_TRAIN, 2)
 print("Test points shape:", x_test.shape)  # (N_GRID*N_GRID, 2)
 print()
 
-############################################################
-# Single run fun.
-############################################################
-model = gp.GaussianProcessRegressor(
-    l1_penalty=1e2,
-    max_iterations=100,
-    tollerance=1e-4,
-    verbose=True,
-    #init_theta=np.zeros([x_train.shape[1], x_train.shape[1]])
-)
-_ = model.fit(x=x_train, y=y_train)
+#############################################################
+## Single run fun.
+#############################################################
+#model = gp.GaussianProcessRegressor(
+#    l1_penalty=1e2,
+#    max_iterations=100,
+#    tollerance=1e-4,
+#    verbose=True,
+#    #init_theta=np.zeros([x_train.shape[1], x_train.shape[1]])
+#)
+#_ = model.fit(x=x_train, y=y_train)
 
 ############################################################
 # Run model at high penalty to extract single sensor.
@@ -115,19 +115,17 @@ _ = model.fit(x=x_train, y=y_train)
 if reverse:
     lambdas = lambdas[::-1]
 
+model = gp.GaussianProcessRegressor(
+    max_iterations=admm_iters,
+    tollerance=1e-4,
+    verbose=True,
+)
+
 thetas = np.nan*np.zeros([I,x_train.shape[1], x_train.shape[1]])
 gns = np.nan*np.zeros([I,M])
 for li,l in enumerate(lambdas):
     reinit = model.parameters.theta if warmstart and li > 0 else None
-    model = gp.GaussianProcessRegressor(
-        l1_penalty=l,
-        max_iterations=admm_iters,
-        tollerance=1e-4,
-        verbose=True,
-        init_theta=reinit,
-        #init_theta=np.zeros([x_train.shape[1], x_train.shape[1]])
-    )
-    _ = model.fit(x=x_train, y=y_train)
+    _ = model.fit(x=x_train, y=y_train, l1_penalty=l) 
     thetas[li,:,:] = model.parameters.theta 
     gns[li,:] = jnp.sum(jnp.square(rearrange(thetas[li,:,:], "o (d k) -> (o k) d", k=3)), axis = 0)
 
