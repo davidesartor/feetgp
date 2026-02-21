@@ -27,6 +27,7 @@ st = time()
 realdata = True
 #warmstart = False
 warmstart = True
+warmzu = True
 reverse = False
 #reverse = True
 #markers = 2
@@ -38,7 +39,7 @@ subsample_factor = 100
 normalize = True
 detrend = False
 
-I = 10
+I = 100
 #I = 2
 #admm_iters = 100
 admm_iters = 500
@@ -119,17 +120,19 @@ model = gp.GaussianProcessRegressor(
     max_iterations=admm_iters,
     tollerance=1e-4,
     verbose=True,
+    warmzu=warmzu,
+    warmstart=warmstart,
 )
 
 thetas = np.nan*np.zeros([I,x_train.shape[1], x_train.shape[1]])
 gns = np.nan*np.zeros([I,M])
 for li,l in enumerate(lambdas):
-    reinit = model.parameters.theta if warmstart and li > 0 else None
+    #reinit = model.parameters.theta if warmstart and li > 0 else None
     _ = model.fit(x=x_train, y=y_train, l1_penalty=l) 
     thetas[li,:,:] = model.parameters.theta 
     gns[li,:] = jnp.sum(jnp.square(rearrange(thetas[li,:,:], "o (d k) -> (o k) d", k=3)), axis = 0)
 
-fig = plt.figure()
+fig = plt.figure(figsize=[10,5])
 plt.subplot(1,2,1)
 plt.plot(lambdas, jnp.round(gns, 8))
 plt.xscale('log')
