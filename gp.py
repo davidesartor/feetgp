@@ -153,6 +153,7 @@ def admm(
     x0: Float[Array, "o d+1"] | None = None,
     z0: Float[Array, "o d+1"] | None = None,
     u0: Float[Array, "o d+1"] | None = None,
+    rho0: float | None = None,
     rho : float | None = None,
     max_iterations: int = 100,
     tollerance: float = 1e-4,
@@ -169,12 +170,13 @@ def admm(
         admm_u = jnp.zeros_like(x0)
     else:
         admm_u = u0
-    print("don't forget rho init!")
-    #rho = 1.0
-    #print("rho is diff!")
-    #rho = 1e5
-    print("rho is lam!")
     rho = l1_penalty
+    if rho0 is not None:
+        print("Ignoring passed rho.")
+    #if rho0 is None:
+    #    rho = l1_penalty
+    #else:
+    #    rho = rho0
 
     trajectory = [(admm_x, admm_z, admm_u, rho)]
     for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
@@ -269,6 +271,7 @@ class GaussianProcessRegressor:
     last_x: Float[Array, "o d+1"] | None = field(default=None)
     last_z: Float[Array, "o d+1"] | None = field(default=None)
     last_u: Float[Array, "o d+1"] | None = field(default=None)
+    last_rho: float | None = field(default=None)
 
     def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"], l1_penalty: float, method ='admm'):
         n, d = x.shape
@@ -319,6 +322,10 @@ class GaussianProcessRegressor:
             u0 = self.last_u
         else:
             u0 = None
+        if self.warmstart and self.warmzu and self.last_rho is not None:
+            rho0 = self.last_rho
+        else:
+            rho0 = None
 
         # run admm
         if method=='admm':
@@ -330,6 +337,7 @@ class GaussianProcessRegressor:
                 x0=x0,
                 z0=z0,
                 u0=u0,
+                rho0=rho0,
                 max_iterations=self.max_iterations,
                 tollerance=self.tollerance,
             )
@@ -445,6 +453,7 @@ class GaussianProcessRegressor:
         self.last_x = jnp.copy(admm_x)
         self.last_z = jnp.copy(admm_z)
         self.last_u = jnp.copy(admm_u)
+        self.last_rho = rho
 
         theta = admm_x[:, :-1]
         g = admm_x[:, -1]

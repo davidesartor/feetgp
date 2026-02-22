@@ -10,8 +10,7 @@ import gp
 import os
 import pandas as pd
 from einops import rearrange
-
-import matplotlib.pyplot as plt
+import pickle
 
 from time import time
 
@@ -31,9 +30,13 @@ warmzu = True
 reverse = False
 #reverse = True
 #markers = 2
-markers = 3
+#markers = 3
 #markers = 4
-#markers = 13
+#markers = 5
+#markers = 6
+#markers = 7
+#markers = 8
+markers = 13
 subsample_factor = 100
 
 normalize = True
@@ -119,7 +122,7 @@ if reverse:
 model = gp.GaussianProcessRegressor(
     max_iterations=admm_iters,
     tollerance=1e-4,
-    verbose=True,
+    verbose=False,
     warmzu=warmzu,
     warmstart=warmstart,
 )
@@ -127,22 +130,26 @@ model = gp.GaussianProcessRegressor(
 thetas = np.nan*np.zeros([I,x_train.shape[1], x_train.shape[1]])
 gns = np.nan*np.zeros([I,M])
 for li,l in enumerate(lambdas):
+    print(f"run {li} lam = {l}")
     #reinit = model.parameters.theta if warmstart and li > 0 else None
     _ = model.fit(x=x_train, y=y_train, l1_penalty=l) 
     thetas[li,:,:] = model.parameters.theta 
     gns[li,:] = jnp.sum(jnp.square(rearrange(thetas[li,:,:], "o (d k) -> (o k) d", k=3)), axis = 0)
 
-fig = plt.figure(figsize=[10,5])
-plt.subplot(1,2,1)
-plt.plot(lambdas, jnp.round(gns, 8))
-plt.xscale('log')
-plt.yscale('log')
-plt.subplot(1,2,2)
-for i in range(thetas.shape[1]):
-    plt.plot(lambdas, jnp.round(thetas[:,i],8))
-plt.xscale('log')
-plt.savefig("temp.pdf")
-plt.close()
+with open("pickles/feb21.pkl",'wb') as f:
+    pickle.dump([thetas, gns, lambdas], f)
+
+#fig = plt.figure(figsize=[10,5])
+#plt.subplot(1,2,1)
+#plt.plot(lambdas, jnp.round(gns, 8))
+#plt.xscale('log')
+#plt.yscale('log')
+#plt.subplot(1,2,2)
+#for i in range(thetas.shape[1]):
+#    plt.plot(lambdas, jnp.round(thetas[:,i],8))
+#plt.xscale('log')
+#plt.savefig("temp.pdf")
+#plt.close()
 
 print("Diff time:")
 print(time() - st)
