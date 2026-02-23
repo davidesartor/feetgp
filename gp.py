@@ -15,7 +15,7 @@ from tqdm import tqdm
 EPS = float(jnp.sqrt(jnp.finfo(float).eps))
 
 FIXED_G = jnp.array(0.001)
-ADAPT_RHO = False
+ADAPT_RHO = False    
 SELF_ZERO = True
 BFGS_ITERS = 1000
 
@@ -115,6 +115,7 @@ def admm_x_update(
     rho: float,
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n o"],
+    n_groups: int,
     bounds: Float[Array, "2 o d+1"],
 ) -> Float[Array, "o d+1"]:
     new_x = []
@@ -123,10 +124,8 @@ def admm_x_update(
     ):
         x_train_i = jnp.copy(x_train)
         if SELF_ZERO:
-            # Stores indices of columns pertaining to current marker.
-            cm_dims = jnp.arange(x_train.shape[0]).reshape([-1, 3])[i // 3, :]
-            x_train_i = x_train_i.at[:, cm_dims].set(0.0)
-
+            start = (i // n_groups) * n_groups
+            x_train_i = x_train_i.at[:, start : start + n_groups].set(0.0)
         ret = scipy.optimize.minimize(
             fun=admm_x_update_loss,
             x0=x,
@@ -137,7 +136,6 @@ def admm_x_update(
             options=dict(maxiter=BFGS_ITERS, ftol=EPS, gtol=0),
         ).x
         new_x.append(ret)
-    #
     new_x = jnp.stack(new_x, axis=0)
     return new_x
 
@@ -187,7 +185,7 @@ def admm(
     trajectory = [ADMMState(admm_x, admm_z, admm_u, rho, l1_penalty)]
     for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
         new_admm_x = admm_x_update(
-            admm_x, admm_z, admm_u, rho, x_train, y_train, bounds
+            admm_x, admm_z, admm_u, rho, x_train, y_train, n_groups, bounds
         )
         new_admm_z = admm_z_update(
             new_admm_x, admm_z, admm_u, rho, n_groups, l1_penalty, bounds
@@ -204,10 +202,16 @@ def admm(
 
         # update rho to balance primal and dual residuals
         if ADAPT_RHO:
-            if jnp.square(primal_residual).sum() > 100 * jnp.square(dual_residual).sum():
+            if (
+                jnp.square(primal_residual).sum()
+                > 100 * jnp.square(dual_residual).sum()
+            ):
                 rho = 2 * rho
                 new_admm_u = new_admm_u / 2
-            elif jnp.square(dual_residual).sum() > 100 * jnp.square(primal_residual).sum():
+            elif (
+                jnp.square(dual_residual).sum()
+                > 100 * jnp.square(primal_residual).sum()
+            ):
                 rho = rho / 2
                 new_admm_u = new_admm_u * 2
 
