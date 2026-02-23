@@ -1,6 +1,9 @@
-# Ignore npz files
+# Ignore xlsx, mat, qtm, tsv, npz, and txt files
+*.xlsx
+*.mat
+*.qtm
+*.tsv
 *.npz
-# Ignore txt files
 *.txt
 
 # ignore .vscode settings folder

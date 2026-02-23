@@ -1,6 +1,7 @@
 from typing import NamedTuple, Optional
 from jaxtyping import Array, Float, Key
 from dataclasses import dataclass, field
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -10,15 +11,34 @@ from jax.numpy.linalg import norm
 from einops import rearrange
 import scipy
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 EPS = float(jnp.sqrt(jnp.finfo(float).eps))
 
+FIXED_G = jnp.array(0.001)
 ADAPT_RHO = False
-#ADAPT_RHO = True
-
 SELF_ZERO = True
-#SELF_ZERO = False
+BFGS_ITERS = 1000
+
+
+class Gaussian(NamedTuple):
+    mean: Float[Array, "n"]
+    cov: Float[Array, "n n"]
+
+
+class Parameters(NamedTuple):
+    theta: Float[Array, "o d"]
+    g: Float[Array, "o"]
+    b: Float[Array, "o"]
+    nu: Float[Array, "o"]
+
+
+class ADMMState(NamedTuple):
+    x: Float[Array, "o d+1"]
+    z: Float[Array, "o d+1"]
+    u: Float[Array, "o d+1"]
+    rho: float
+    l: float
+
 
 def squared_distance(
     x1: Float[Array, "n d"],
@@ -29,6 +49,7 @@ def squared_distance(
 
     dist = jax.vmap(jax.vmap(dist, (None, 0)), (0, None))
     return dist(x1, x2)
+
 
 def kernel(
     x1: Float[Array, "n d"],
@@ -79,16 +100,12 @@ def admm_x_update_loss(
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n"],
 ):
-    #theta, g = admm_x[:-1], admm_x[-1]
+    # theta, g = admm_x[:-1], admm_x[-1]
     theta, _ = admm_x[:-1], admm_x[-1]
-    #g = 0.1
-    #g = 0.01
-    g = 0.001
-    print("ignoring g arg.")
+    g = FIXED_G
     loglik, _, _ = likelihood(theta, g, x_train, y_train)
     lagrangian = 0.5 * rho * jnp.sum((admm_x - admm_z + admm_u) ** 2)
     return -loglik + lagrangian
-
 
 
 def admm_x_update(
@@ -101,13 +118,14 @@ def admm_x_update(
     bounds: Float[Array, "2 o d+1"],
 ) -> Float[Array, "o d+1"]:
     new_x = []
-    for i, x, z, u, y, bmin, bmax in zip(range(admm_x.shape[0]), admm_x, admm_z, admm_u, y_train.T, *bounds):
-        #print(i)
+    for i, (x, z, u, y, bmin, bmax) in enumerate(
+        zip(admm_x, admm_z, admm_u, y_train.T, *bounds)
+    ):
         x_train_i = jnp.copy(x_train)
         if SELF_ZERO:
-            # Stores indices of columns pertaining to current marker. 
-            cm_dims = jnp.arange(x_train.shape[0]).reshape([-1,3])[i//3,:] 
-            x_train_i = x_train_i.at[:,cm_dims].set(0.)
+            # Stores indices of columns pertaining to current marker.
+            cm_dims = jnp.arange(x_train.shape[0]).reshape([-1, 3])[i // 3, :]
+            x_train_i = x_train_i.at[:, cm_dims].set(0.0)
 
         ret = scipy.optimize.minimize(
             fun=admm_x_update_loss,
@@ -116,8 +134,7 @@ def admm_x_update(
             jac=True,
             method="L-BFGS-B",
             bounds=[(a, b) for a, b in zip(bmin, bmax)],
-            #options=dict(maxiter=10, ftol=EPS, gtol=0),
-            options=dict(maxiter=1000, ftol=EPS, gtol=0),
+            options=dict(maxiter=BFGS_ITERS, ftol=EPS, gtol=0),
         ).x
         new_x.append(ret)
     #
@@ -125,67 +142,56 @@ def admm_x_update(
     return new_x
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=["n_groups"])
 def admm_z_update(
     admm_x: Float[Array, "o d+1"],
     admm_z: Float[Array, "o d+1"],
     admm_u: Float[Array, "o d+1"],
     rho: float,
+    n_groups: int,
     l1_penalty: float,
     bounds: Float[Array, "2 o d+1"],
 ) -> Float[Array, "o d+1"]:
     theta = (admm_x + admm_u)[:, :-1]
     g = (admm_x + admm_u)[:, -1]
-    theta = rearrange(theta, "o (d k) -> (o k) d", k=3)
+    theta = rearrange(theta, "o (d k) -> (o k) d", k=n_groups)
     prox = jnp.maximum(0, 1 - (l1_penalty / rho / norm(theta, axis=0)))
     theta = prox * theta
-    theta = rearrange(theta, "(o k) d -> o (d k)", k=3)
+    theta = rearrange(theta, "(o k) d -> o (d k)", k=n_groups)
     new_z = admm_z.at[:, :-1].set(theta)
     new_z = new_z.at[:, -1].set(g)  # no regularization on g
     return new_z.clip(*bounds)  # in case bounds do not include 0
 
 
 def admm(
+    warmstart: ADMMState,
     x_train: Float[Array, "n d"],
     y_train: Float[Array, "n o"],
-    bounds: Float[Array, "2 o d+1"],
     l1_penalty: float,
-    x0: Float[Array, "o d+1"] | None = None,
-    z0: Float[Array, "o d+1"] | None = None,
-    u0: Float[Array, "o d+1"] | None = None,
-    rho0: float | None = None,
-    rho : float | None = None,
-    max_iterations: int = 100,
-    tollerance: float = 1e-4,
+    n_groups: int,
+    bounds: Float[Array, "2 o d+1"],
+    max_iterations: int,
+    tollerance: float,
 ):
-    if x0 is None:
-        admm_x = jnp.zeros([y_train.shape[1], x_train.shape[1]+1])
-    else:
-        admm_x = x0
-    if z0 is None:
-        admm_z = x0
-    else:
-        admm_z = z0
-    if u0 is None:
-        admm_u = jnp.zeros_like(x0)
-    else:
-        admm_u = u0
-    rho = l1_penalty
-    if rho0 is not None:
-        print("Ignoring passed rho.")
-    #if rho0 is None:
-    #    rho = l1_penalty
-    #else:
-    #    rho = rho0
+    n, d = x_train.shape
+    n, o = y_train.shape
 
-    trajectory = [(admm_x, admm_z, admm_u, rho)]
+    admm_x = warmstart.x
+    admm_z = warmstart.z
+    admm_u = warmstart.u
+    rho = warmstart.rho
+
+    if not ADAPT_RHO or ADAPT_RHO:
+        rho = l1_penalty
+
+    trajectory = [ADMMState(admm_x, admm_z, admm_u, rho, l1_penalty)]
     for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
         new_admm_x = admm_x_update(
             admm_x, admm_z, admm_u, rho, x_train, y_train, bounds
         )
-        #print(f"New x: {admm_x}")
-        new_admm_z = admm_z_update(new_admm_x, admm_z, admm_u, rho, l1_penalty, bounds)
-        #print(f"New z: {admm_z}")
+        new_admm_z = admm_z_update(
+            new_admm_x, admm_z, admm_u, rho, n_groups, l1_penalty, bounds
+        )
         new_admm_u = admm_u + new_admm_x - new_admm_z
 
         # check convergence
@@ -198,10 +204,10 @@ def admm(
 
         # update rho to balance primal and dual residuals
         if ADAPT_RHO:
-            if primal_residual.sum() > 10 * dual_residual.sum():
+            if jnp.square(primal_residual).sum() > 100 * jnp.square(dual_residual).sum():
                 rho = 2 * rho
                 new_admm_u = new_admm_u / 2
-            elif dual_residual.sum() > 10 * primal_residual.sum():
+            elif jnp.square(dual_residual).sum() > 100 * jnp.square(primal_residual).sum():
                 rho = rho / 2
                 new_admm_u = new_admm_u * 2
 
@@ -215,7 +221,7 @@ def admm(
 
         # update state and possibly early stop
         admm_x, admm_z, admm_u = new_admm_x, new_admm_z, new_admm_u
-        trajectory.append((admm_x, admm_z, admm_u, rho))
+        trajectory.append(ADMMState(admm_x, admm_z, admm_u, rho, l1_penalty))
         if primal_ok.all() and dual_ok.all():
             break
     else:
@@ -236,57 +242,34 @@ def hetgpy_auto_bounds(x, min_cor=0.01, max_cor=0.5):
     return lower, upper
 
 
-class Gaussian(NamedTuple):
-    mean: Float[Array, "n"]
-    cov: Float[Array, "n n"]
-
-
-class Parameters(NamedTuple):
-    theta: Float[Array, "o d"]
-    g: Float[Array, "o"]
-    b: Float[Array, "o"]
-    nu: Float[Array, "o"]
-
-
 @dataclass
 class GaussianProcessRegressor:
-    #l1_penalty: float
+    x_train: Float[Array, "n d"]
+    y_train: Float[Array, "n o"]
+    n_groups: int
+    normalize: bool = True
     max_iterations: int = 1000
     tollerance: float = 1e-4
     seed: int = 42
     verbose: bool = False
-    warmstart: bool = True
-    warmzu: bool = False
-    #init_theta: Optional[Float[Array, "o d"]] = None
-    #init_g: Optional[Float[Array, "o"]] = None
 
     # params to fit after training
     parameters: Parameters = field(init=False)
     x: Float[Array, "n d"] = field(init=False)
     y: Float[Array, "n o"] = field(init=False)
-    trajectory: list = field(init=False)
     bounds: Float[Array, "2 o d"] = field(init=False)
+    trajectory: list[ADMMState] = field(init=False)
 
-    # to save last part of optim trajectory.
-    last_x: Float[Array, "o d+1"] | None = field(default=None)
-    last_z: Float[Array, "o d+1"] | None = field(default=None)
-    last_u: Float[Array, "o d+1"] | None = field(default=None)
-    last_rho: float | None = field(default=None)
-
-    def fit(self, x: Float[Array, "n d"], y: Float[Array, "n 1"], l1_penalty: float, method ='admm'):
-        n, d = x.shape
-        n, o = y.shape
+    def __post_init__(self):
+        n, d = self.x_train.shape
+        n, o = self.y_train.shape
 
         # initialization
         # hetgpy uses a different parametrization for theta
         # i.e. out_theta = 1 / sqrt(hetgpy_theta)
-        lower, upper = hetgpy_auto_bounds(x)
+        lower, upper = hetgpy_auto_bounds(self.x_train)
         init_theta = jnp.tile(1 / (0.9 * upper + 0.1 * lower) ** 0.5, (o, 1))
         init_g = jnp.array([0.1] * o)
-        #if self.init_theta is not None:
-        #    init_theta = self.init_theta
-        #if self.init_g is not None:
-        #    init_g = self.init_g
         if self.verbose:
             print(f"Initial theta: {init_theta}")
             print(f"Initial g: {init_g}")
@@ -309,186 +292,62 @@ class GaussianProcessRegressor:
             print(f"Max: {self.bounds[1, ..., -1]}")
             print()
 
-        results = []
-        if self.last_x is None or not self.warmstart:
-            x0 = jnp.concatenate([init_theta, init_g[:, None]], axis=-1)
-        else:
-            x0 = self.last_x
-        if self.warmstart and self.warmzu and self.last_z is not None:
-            z0 = self.last_z
-        else:
-            z0 = None
-        if self.warmstart and self.warmzu and self.last_u is not None:
-            u0 = self.last_u
-        else:
-            u0 = None
-        if self.warmstart and self.warmzu and self.last_rho is not None:
-            rho0 = self.last_rho
-        else:
-            rho0 = None
+        # initialize ADMM state
+        admm_state = ADMMState(
+            x=jnp.concat([init_theta, init_g[:, None]], axis=-1),
+            z=jnp.concat([init_theta, init_g[:, None]], axis=-1),
+            u=jnp.zeros((o, d + 1)),
+            rho=1.0,
+            l=1.0,
+        )
+        self.trajectory = [admm_state]
 
+    def fit(self, l1_penalty: float):
         # run admm
-        if method=='admm':
-            trajectory = admm(
-                x_train=x,
-                y_train=y,
-                bounds=self.bounds,
-                l1_penalty=l1_penalty,
-                x0=x0,
-                z0=z0,
-                u0=u0,
-                rho0=rho0,
-                max_iterations=self.max_iterations,
-                tollerance=self.tollerance,
-            )
-        elif method=='pgd':
-            import IPython; IPython.embed()
-
-            def prox_l1(theta, lam):
-                theta = rearrange(theta, "o (d k) -> (o k) d", k=3)
-                prox = jnp.maximum(0, 1 - (lam / norm(theta, axis=0)))
-                theta = prox * theta
-                theta = rearrange(theta, "(o k) d -> o (d k)", k=3)
-                return theta
-
-            x_use = jnp.stack([x for _ in range(x.shape[1]) ])
-            if SELF_ZERO:
-                for i in range(x.shape[1]):
-                    cm_dims = jnp.arange(x.shape[0]).reshape([-1,3])[i//3,:] 
-                    x_use = x_use.at[i,:,cm_dims].set(0.)
-            
-            def _total_nll(theta, g, x_use, y):
-                print("assuming that we are not deleting self!")
-                #likelihood(theta[1,:], g[1,:], x, y[:,1])
-                lls, _, _ = jax.vmap(likelihood, [0,0,0,1])(theta, g, x_use, y)
-                return(-jnp.sum(lls))
-            total_nll = jax.jit(jax.value_and_grad(_total_nll, argnums=(0,1)))
-
-            theta = init_theta
-            g = init_g[:,None]
-            #g = jnp.ones_like(init_g[:,None])
-
-            #lr_theta = 1e-3
-            lr_theta = 1e-4
-            iters = 1000    
-
-            learn_g = False
-            #learn_g = True
-            chill_g = True
-
-            #g_cands = jnp.logspace(jnp.log10(g_bounds[0]), jnp.log10(g_bounds[1]),num=10)
-
-            traj_theta = jnp.nan*jnp.zeros((iters,)+theta.shape)
-            traj_g = jnp.nan*jnp.zeros((iters,)+g.shape)
-            costs = jnp.nan*jnp.zeros(iters)
-            costs_f = jnp.nan*jnp.zeros(iters)
-            costs_g = jnp.nan*jnp.zeros(iters)
-            for i in tqdm(range(iters)):
-
-                if i == 658:
-                    break
-
-                # Assuming common g for all problems! 
-                if learn_g:
-                    if chill_g:
-                        lb = jnp.power(10, (i/iters) * -4 + (1-i/iters)*-1)
-                        g_cands = jnp.logspace(lb, jnp.log10(g_bounds[1]),num=10)
-                    else:
-                        g_cands = jnp.logspace(jnp.log10(g_bounds[0]), jnp.log10(g_bounds[1]),num=10)
-                    g_grid = jnp.stack([g_cands for _ in range(g.shape[0])],axis=1)[:,:,None]
-
-                    g_cost, _ = jax.vmap(total_nll, [None,0,None,None])(theta, g_grid, x_use, y)
-                    g_opt = g_cands[jnp.argmin(g_cost)]
-                    g = jnp.ones_like(g)*g_opt
-
-                # GD step.
-                cost, (theta_grad, g_grad) = total_nll(theta, g, x_use, y)
-                theta = theta - lr_theta*theta_grad
-                theta = prox_l1(theta, l1_penalty * lr_theta)
-                #g = g - lr_g*g_grad
-
-                # Projection
-                print("this should be before prox")
-                theta = theta.clip(*bounds[:,:,:-1])
-                #g = g.clip(*bounds[:,:,-1:])
-
-                pen = l1_penalty*jnp.sum(jnp.sqrt(jnp.sum(jnp.square(theta),axis=0)))
-                costs_f = costs_f.at[i].set(cost)
-                costs_g = costs_g.at[i].set(pen)
-                costs = costs.at[i].set(cost+pen)
-                traj_theta = traj_theta.at[i,:,:].set(theta)
-                traj_g = traj_g.at[i].set(g)
-
-                if i > 0:
-                    d = costs[i] - costs[i-1]
-                    if d > 0:
-                        print(i)
-                            
-
-            fig = plt.figure(figsize=[15,5])
-            plt.subplot(1,3,1)
-            plt.plot(costs, label = 'f+g')
-            plt.plot(costs_f, label = 'nll')
-            plt.plot(costs_g, label = 'pen')
-            plt.legend()
-            ax = plt.gca().twinx()
-            ax.scatter(jnp.arange(iters-1),jnp.diff(costs))
-            plt.axhline(0, alpha=0.5, color='gray')
-            plt.title('Cost')
-            plt.subplot(1,3,2)
-            for i in range(theta.shape[0]):
-                for j in range(theta.shape[0]):
-                    plt.plot(traj_theta[:,i,j])
-            plt.title(r"$\theta$")
-            plt.subplot(1,3,3)
-            plt.plot(traj_g[:,:,0])
-            plt.title("g")
-            plt.savefig('pgd.pdf')
-            plt.close()
-        else:
-            raise Exception('Unknown method in fit.')
+        trajectory = admm(
+            warmstart=self.trajectory[-1],
+            x_train=self.x_train,
+            y_train=self.y_train,
+            l1_penalty=l1_penalty,
+            n_groups=self.n_groups,
+            bounds=self.bounds,
+            max_iterations=self.max_iterations,
+            tollerance=self.tollerance,
+        )
+        self.trajectory.extend(trajectory[1:])  # skip the warmstart state
 
         # extract the optimal parameters and infer the rest
-        admm_x, admm_z, admm_u, rho = trajectory[-1]
-        self.last_x = jnp.copy(admm_x)
-        self.last_z = jnp.copy(admm_z)
-        self.last_u = jnp.copy(admm_u)
-        self.last_rho = rho
+        admm_x, admm_z, admm_u, rho, l = self.trajectory[-1]
+        theta = admm_x[..., :-1]
+        g = admm_x[..., -1]
 
-        theta = admm_x[:, :-1]
-        g = admm_x[:, -1]
-        llk, b, nu = jax.vmap(likelihood, in_axes=(0, 0, None, 1))(theta, g, x, y)
-        glasso = jnp.sum(norm(rearrange(theta, "o (d k) -> (o k) d", k=3), axis=0))
-        loss = -llk.sum() + l1_penalty * glasso
-        results.append((loss, trajectory, theta, g, b, nu))
+        # iterate to avoid OOM with vmap
+        llk_b_nu = [
+            likelihood(theta_i, g_i, self.x_train, y_i)
+            for theta_i, g_i, y_i in zip(theta, g, self.y_train.T)
+        ]
+        llk, b, nu = jnp.array(list(zip(*llk_b_nu)))
+
+        self.parameters = Parameters(theta, g, b, nu)
         if self.verbose:
             print(f"Optimal theta: {theta}")
             print(f"Optimal g: {g}")
             print(f"Optimal b: {b}")
             print(f"Optimal nu: {nu}")
-            print(f"Log-likelihood at optimum: {llk}")
+            print(f"Log-likelihood at optimum: {llk.sum()}")
             print()
-
-        #import IPython; IPython.embed()
-
-        # best result (minimum loss) across the multiple random restarts
-        trajectory, theta, g, b, nu = min(results, key=lambda x: x[0])[1:]
-
-        # save stuff
-        self.trajectory = trajectory
-        self.parameters = Parameters(theta, g, b, nu)
-        self.x = x
-        self.y = y
         return self
 
     def predict(self, x: Float[Array, "n d"]) -> Gaussian:
-        n, d = self.x.shape
-        n, o = self.y.shape
+        n, d = self.x_train.shape
+        n, o = self.y_train.shape
 
-        def predict_single(params, y):
-            theta, g, b, nu = params
-            Koo = nu * (kernel(self.x, self.x, theta) + jnp.eye(n) * (EPS + g))
-            Kxo = nu * kernel(x, self.x, theta)
+        def predict_single(theta, g, b, nu, y):
+            g = FIXED_G
+            Koo = nu * (
+                kernel(self.x_train, self.x_train, theta) + jnp.eye(n) * (EPS + g)
+            )
+            Kxo = nu * kernel(x, self.x_train, theta)
             Kxx = nu * kernel(x, x, theta)
 
             # posterior mean and covariance
@@ -500,4 +359,11 @@ class GaussianProcessRegressor:
             cov = cov + (1 - Kbx).T @ (1 - Kbx) / jnp.linalg.inv(Koo).sum()
             return Gaussian(mean=mean, cov=cov)
 
-        return jax.vmap(predict_single)(self.parameters, self.y.T)
+        preds = [
+            predict_single(theta_i, g_i, b_i, nu_i, y_i)
+            for theta_i, g_i, b_i, nu_i, y_i in zip(*self.parameters, self.y_train.T)
+        ]
+        return Gaussian(
+            mean=jnp.stack([pred.mean for pred in preds]),
+            cov=jnp.stack([pred.cov for pred in preds]),
+        )
