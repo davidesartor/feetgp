@@ -5,6 +5,8 @@
 *.tsv
 *.npz
 *.txt
+# Ignore slurm files 
+*.slurm
 
 # ignore .vscode settings folder
 .vscode/

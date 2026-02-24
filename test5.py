@@ -17,9 +17,9 @@ jax.config.update("jax_enable_x64", True)
 ############################################################
 
 NORMALIZE = True
-ADMM_MAX_ITER = 1000
+ADMM_MAX_ITER = 500
 ADMM_TOL = 1e-3
-LAMBDAS = 10 ** jnp.linspace(0, 4, 100)
+LAMBDAS = 10 ** jnp.linspace(1, 6, 100)
 
 
 MARKERS = [
