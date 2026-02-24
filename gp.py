@@ -16,7 +16,7 @@ EPS = float(jnp.sqrt(jnp.finfo(float).eps))
 
 FIXED_G = jnp.array(0.001)
 ADAPT_RHO = False    
-SELF_ZERO = False
+SELF_ZERO = True
 BFGS_ITERS = 1000
 
 

@@ -9,7 +9,7 @@ import pandas as pd
 from einops import rearrange
 import matplotlib.pyplot as plt
 
-os.makedirs("test6", exist_ok=True)
+os.makedirs("test5a", exist_ok=True)
 jax.config.update("jax_enable_x64", True)
 
 ############################################################
@@ -19,7 +19,7 @@ jax.config.update("jax_enable_x64", True)
 NORMALIZE = True
 ADMM_MAX_ITER = 500
 ADMM_TOL = 1e-3
-LAMBDAS = 10 ** jnp.linspace(0, 5, 100)
+LAMBDAS = 10 ** jnp.linspace(1, 6, 100)
 
 
 MARKERS = [
@@ -37,8 +37,8 @@ MARKERS = [
     "NAV",
     "TOE",
 ]
-MARKERS = [p + x for x in MARKERS for p in ("L", "R")]
-GROUPS = 6  # LX, LY, LZ, RX, RY, RZ
+MARKERS = [f"R{m}" for m in MARKERS]
+GROUPS = 3  # x, y, z
 SUBSAMPLE_FACTOR = 20  # 10Hz
 
 
@@ -134,28 +134,28 @@ for i, l in enumerate(LAMBDAS):
 
     # plot progress
     plt.figure(figsize=[10, 5])
-    colors = plt.cm.tab20(np.linspace(0, 1, len(MARKERS) // 2))
+    colors = plt.cm.tab20(np.linspace(0, 1, len(MARKERS)))
     plt.subplot(1, 2, 1)
-    for j in range(len(MARKERS) // 2):
-        plt.plot(LAMBDAS, glassos[:, j], color=colors[j], label=MARKERS[2*j][1:])
+    for j in range(len(MARKERS)):
+        plt.plot(LAMBDAS, glassos[:, j], color=colors[j], label=MARKERS[j][1:])
     plt.grid()
     plt.xscale("log")
     plt.yscale("log")
 
     plt.subplot(1, 2, 2)
-    for j in range(len(MARKERS) // 2):
-        plt.plot(LAMBDAS, r2_avgs[:, j], color=colors[j], label=MARKERS[2*j][1:])
+    for j in range(len(MARKERS)):
+        plt.plot(LAMBDAS, r2_avgs[:, j], color=colors[j], label=MARKERS[j][1:])
     plt.xscale("log")
     plt.ylim(0.0, 1.05)
     plt.grid()
     plt.legend()
-    
-    plt.savefig(f"test6/regularization_effect.pdf")
+
+    plt.savefig(f"test5a/regularization_effect.pdf")
     plt.close()
 
     # save intermediate model parameters
     np.savez(
-        f"test6/model_{i}.npz",
+        f"test5a/model_{i}.npz",
         l=l,
         theta=model.parameters.theta,
         g=model.parameters.g,
@@ -165,7 +165,7 @@ for i, l in enumerate(LAMBDAS):
 
 # save aggregate results
 np.savez(
-    f"test6/aggregate_results.npz",
+    f"test5a/aggregate_results.npz",
     l=LAMBDAS,
     theta=thetas,
     r2=r2s,
