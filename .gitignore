@@ -10,6 +10,7 @@
 *.err
 # Ignore slurm files 
 *.slurm
+*.html
 
 # ignore .vscode settings folder
 .vscode/
