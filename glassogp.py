@@ -1,4 +1,5 @@
 from typing import NamedTuple, Optional, Self
+from cycler import K
 from jaxtyping import Array, Float, Scalar, Bool
 
 import jax
@@ -223,10 +224,15 @@ class GroupLassoGaussianProcess(NamedTuple):
     def predict(
         self, xs: Float[Array, "m d*g"]
     ) -> tuple[Float[Array, "o m"], Float[Array, "o m m"]]:
-        v_kernel = jax.vmap(kernel, in_axes=(0, None, None))
+        # use scan instead of vmap to avoid OOM
+        def scan_kernel(theta, xs1, xs2):
+            body = lambda _, t: (_, kernel(t, xs1, xs2))
+            _, K = jax.lax.scan(body, None, theta)
+            return K
+
         nu = self.nu[:, None, None]
-        Kxx = nu * v_kernel(self.theta, xs, xs)
-        Kox = nu * v_kernel(self.theta, self.x_train, xs)
+        Kxx = nu * scan_kernel(self.theta, xs, xs)
+        Kox = nu * scan_kernel(self.theta, self.x_train, xs)
         Koo = nu * self.Koo
         return jax.vmap(gp_posterior)(Kxx, Kox, Koo, self.y_train.T, self.b)
 
