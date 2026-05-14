@@ -41,6 +41,7 @@ class InclineRunning:
         feet: Literal["both", "left_only", "right_only"] = "both",
         target: Literal["markers", "forces"] = "markers",
         inclines: Literal["all", "inc0", "inc5", "inc10"] = "all",
+        relative: bool = True,
     ):
         self.path = path
         if feet == "both":
@@ -57,7 +58,7 @@ class InclineRunning:
             raise ValueError(f"feet must be 'both|left_only|right_only', got {feet}")
 
         # load marker data for the input features
-        df_markers = self.load_marker_data(inclines)
+        df_markers = self.load_marker_data(inclines, relative)
         x = df_markers.values
         print("Loaded marker data with shape:", x.shape, x.dtype)
 
@@ -99,7 +100,9 @@ class InclineRunning:
         self.y_test = (self.y_test - y_mean) / y_std
 
     def load_marker_data(
-        self, inclines: Literal["all", "inc0", "inc5", "inc10"] = "all"
+        self,
+        inclines: Literal["all", "inc0", "inc5", "inc10"] = "all",
+        relative: bool = False,
     ):
         def load_tsv_file(filepath):
             df = pd.read_csv(filepath, sep="\t", skiprows=10)
@@ -115,7 +118,17 @@ class InclineRunning:
             load_tsv_file(os.path.join(self.path, f"{f}.tsv"))
             for f in tqdm(files, desc="Loading Marker Data")
         ]
-        return pd.concat(dfs, ignore_index=True)
+        df = pd.concat(dfs, ignore_index=True)
+        if relative:
+            for prefix in ("L", "R"):
+                for coord in ("X", "Y", "Z"):
+                    # all columns for this foot and coordinate, e.g. LCAL_X, LCUB_X, ...
+                    cols = [c for c in df.columns if c.startswith(prefix)]
+                    cols = [c for c in cols if c.endswith(coord)]
+                    if not cols:
+                        continue
+                    df[cols] = df[cols].subtract(df[cols].mean(axis=1), axis=0)
+        return df
 
     def load_ground_reaction_forces(
         self, inclines: Literal["all", "inc0", "inc5", "inc10"] = "all"
