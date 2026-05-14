@@ -109,7 +109,7 @@ class GLASSOADMMState(NamedTuple):
         mask: Float[Array, "d*g"],
     ):
         theta, g = x[:-1], x[-1]
-    
+
         # used a masked version of lenghtscales for likelihood
         Koo = kernel(theta * mask, x_train, x_train)
         Koo = Koo + g * jnp.eye(len(y_train))
@@ -245,7 +245,10 @@ class GroupLassoGaussianProcess(NamedTuple):
             lambda _, t: (_, kernel(t, x_train, x_train)), None, theta
         )
         Koo = Koo + g[..., None, None] * jnp.eye(len(y_train))
-        llk, b, nu = jax.vmap(loglikelihood)(Koo, y_train.T)
+        # again, use scan instead of vmap to avoid OOM
+        _, (llk, b, nu) = jax.lax.scan(
+            lambda _, K_y: (_, loglikelihood(*K_y)), None, (Koo, y_train.T)
+        )
         self = cls(theta, g, b, nu, x_train, y_train, Koo)
         return self, llk.sum()
 
@@ -281,7 +284,10 @@ class GroupLassoGaussianProcess(NamedTuple):
         state = (
             GLASSOADMMState.initialize(bounds, l1_penalty, group_size)
             if warmstart is None
-            else warmstart._replace(l1=l1_penalty)
+            else warmstart._replace(
+                rho=l1_penalty * jnp.ones_like(warmstart.rho),
+                l1=l1_penalty,
+            )
         )
 
         for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
