@@ -6,15 +6,15 @@ requires-python = ">=3.12"
 readme = "README.md"
 dependencies = [
     "einops>=0.8.2",
+    "equinox>=0.13.8",
     "ipykernel>=7.2.0",
     "jax[cuda]>=0.9.0.1",
     "jaxtyping>=0.3.7",
-    "joblib>=1.5.3",
     "matplotlib>=3.10.8",
+    "nbformat>=5.10.4",
     "numpy>=2.4.2",
-    "openpyxl>=3.1.5",
     "pandas>=3.0.0",
-    "plotly>=6.5.2",
+    "plotly>=6.7.0",
     "scikit-learn>=1.8.0",
     "tqdm>=4.67.3",
 ]

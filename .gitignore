@@ -4,7 +4,10 @@
 *.qtm
 *.tsv
 *.npz
+*.pkl
 *.txt
+*.out
+*.err
 # Ignore slurm files 
 *.slurm
 
