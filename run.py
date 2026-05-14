@@ -141,7 +141,11 @@ if __name__ == "__main__":
         with open(os.path.join(save_dir, fname), "wb") as f:
             results = dict(
                 l1_penalty=float(l1_penalty),
-                model=model,
+                model=(
+                    model
+                    if isinstance(model, GroupLassoLinear)
+                    else model._replace(x_train=None, y_train=None, Koo=None)
+                ),
                 group_norms=gn,
                 r2=r2,
                 llk=float(llk) if llk is not None else None,

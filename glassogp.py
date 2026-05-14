@@ -133,11 +133,8 @@ class GLASSOADMMState(NamedTuple):
         maxiter: int = 10,
     ) -> Self:
         new_x = []
-        for i, (x, z, u, y, bmin, bmax) in tqdm(
-            enumerate(zip(self.x, self.z, self.u, y_train.T, *self.bounds)),
-            desc="X update",
-            total=len(self.x),
-            leave=False,
+        for i, (x, z, u, y, bmin, bmax) in enumerate(
+            zip(self.x, self.z, self.u, y_train.T, *self.bounds)
         ):
             # zero out self referential entries if autoregressive
             theta_mask = jnp.ones(x_train.shape[-1])
