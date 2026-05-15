@@ -117,10 +117,7 @@ if __name__ == "__main__":
     def r2_scores(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
     ) -> Float[NDArray, "o"]:
-        y_pred = model.predict(x_test)
-        if isinstance(model, GroupLassoGaussianProcess):
-            y_pred = y_pred[0]
-        y_pred = np.array(y_pred)
+        y_pred = np.array(model.predict(x_test))
         r2 = np.array([r2_score(y_test[:, j], y_pred[j, :]) for j in range(o)])
         return r2
 
@@ -144,7 +141,7 @@ if __name__ == "__main__":
                 model=(
                     model
                     if isinstance(model, GroupLassoLinear)
-                    else model._replace(x_train=None, y_train=None, Koo=None)
+                    else model._replace(x_train=None, y_train=None)
                 ),
                 group_norms=gn,
                 r2=r2,

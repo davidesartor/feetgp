@@ -1,3 +1,4 @@
+from re import S
 from typing import NamedTuple, Optional, Self
 from cycler import K
 from jaxtyping import Array, Float, Scalar, Bool
@@ -130,7 +131,7 @@ class GLASSOADMMState(NamedTuple):
         x_train: Float[Array, "n d*g"],
         y_train: Float[Array, "n o"],
         autoregressive: bool,
-        maxiter: int = 10,
+        maxiter: int = 100,
     ) -> Self:
         new_x = []
         for i, (x, z, u, y, bmin, bmax) in enumerate(
@@ -215,23 +216,40 @@ class GroupLassoGaussianProcess(NamedTuple):
 
     x_train: Float[Array, "n d*g"]
     y_train: Float[Array, "n o"]
-    Koo: Float[Array, "o n n"]
 
-    @jax.jit
+    @eqx.filter_jit
     def predict(
-        self, xs: Float[Array, "m d*g"]
-    ) -> tuple[Float[Array, "o m"], Float[Array, "o m m"]]:
-        # use scan instead of vmap to avoid OOM
-        def scan_kernel(theta, xs1, xs2):
-            body = lambda _, t: (_, kernel(t, xs1, xs2))
-            _, K = jax.lax.scan(body, None, theta)
-            return K
+        self, xs: Float[Array, "m d*g"], covariance: bool = False
+    ) -> Float[Array, "o m"] | tuple[Float[Array, "o m"], Float[Array, "o m m"]]:
+        if not covariance:
+            mean, cov = jax.vmap(lambda x: self.predict(x, covariance=True))(
+                xs[:, None, :]
+            )
+            return mean.squeeze(-1).T
 
-        nu = self.nu[:, None, None]
-        Kxx = nu * scan_kernel(self.theta, xs, xs)
-        Kox = nu * scan_kernel(self.theta, self.x_train, xs)
-        Koo = nu * self.Koo
-        return jax.vmap(gp_posterior)(Kxx, Kox, Koo, self.y_train.T, self.b)
+        def predict_single_output(
+            theta: Float[Array, "d*g"],
+            g: Scalar,
+            b: Scalar,
+            nu: Scalar,
+            y_train: Float[Array, "n"],
+        ) -> tuple[Float[Array, "m"], Float[Array, "m m"]]:
+            Kxx = nu * kernel(theta, xs, xs)
+            Kox = nu * kernel(theta, self.x_train, xs)
+            Koo = nu * (
+                kernel(theta, self.x_train, self.x_train)
+                + g * jnp.eye(len(self.y_train))
+            )
+            mean, cov = gp_posterior(Kxx, Kox, Koo, y_train, b)
+            return mean, cov
+
+        # use scan instead of vmap to avoid OOM
+        _, (mean, cov) = jax.lax.scan(
+            lambda _, args: (_, predict_single_output(*args)),
+            None,
+            (self.theta, self.g, self.b, self.nu, self.y_train.T),
+        )
+        return mean, cov
 
     @classmethod
     @eqx.filter_jit
@@ -243,16 +261,22 @@ class GroupLassoGaussianProcess(NamedTuple):
     ) -> tuple[Self, Scalar]:
         # extract the optimal parameters and infer the rest
         theta, g = admm_x[..., :-1], admm_x[..., -1]
+
         # use scan instead of vmap over theta to avoid OOM
-        _, Koo = jax.lax.scan(
-            lambda _, t: (_, kernel(t, x_train, x_train)), None, theta
-        )
-        Koo = Koo + g[..., None, None] * jnp.eye(len(y_train))
-        # again, use scan instead of vmap to avoid OOM
+        def unpack_single_output(
+            theta: Float[Array, "d*g"],
+            g: Scalar,
+            y_train: Float[Array, "n"],
+        ) -> tuple[Scalar, Scalar, Scalar]:
+            Koo = kernel(theta, x_train, x_train) + g * jnp.eye(len(y_train))
+            return loglikelihood(Koo, y_train)
+
         _, (llk, b, nu) = jax.lax.scan(
-            lambda _, K_y: (_, loglikelihood(*K_y)), None, (Koo, y_train.T)
+            lambda _, args: (_, unpack_single_output(*args)),
+            None,
+            (theta, g, y_train.T),
         )
-        self = cls(theta, g, b, nu, x_train, y_train, Koo)
+        self = cls(theta, g, b, nu, x_train, y_train)
         return self, llk.sum()
 
     @classmethod
