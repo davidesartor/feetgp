@@ -289,8 +289,8 @@ class GroupLassoGaussianProcess(NamedTuple):
         autoregressive: bool = True,
         *,
         warmstart: Optional[GLASSOADMMState] = None,
-        theta_range: tuple[float, float] = (0.0, 100.0),
-        g_range: tuple[float, float] = (EPS, 10.0),
+        theta_range: tuple[float, float] = (0.0, 1.0),
+        g_range: tuple[float, float] = (EPS, 1.0),
         max_iterations: int = 100,
         tol: Scalar = jnp.array(1e-4),
     ) -> tuple[Self, GLASSOADMMState, Scalar]:

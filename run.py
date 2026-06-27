@@ -41,7 +41,7 @@ if __name__ == "__main__":
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
 
     # OPTIMIZATION ARGS
-    parser.add_argument("--maxiter", type=int, default=1000)
+    parser.add_argument("--maxiter", type=int, default=500)
     parser.add_argument("--tol", type=float, default=1e-3)
     parser.add_argument("--lambda_budget", type=int, default=100)
     args = parser.parse_args()
@@ -128,7 +128,7 @@ if __name__ == "__main__":
     ):
         gn = group_norms(model)
         r2 = r2_scores(model)
-        n_active = int(np.sum(gn > 1e-2))
+        n_active = int(np.sum(gn > 1e-8))
         print(f"lambda = {l1_penalty:.4g}")
         print(f"    active groups = {n_active}/{len(gn)}")
         print(f"    max gnorm = {gn.max():.4f}")
