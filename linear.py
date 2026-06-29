@@ -55,10 +55,11 @@ class GLASSOADMMState(NamedTuple):
         dual_ok = dual_residual < EPS + tol * dual_target
 
         # update rho and u to balance primal and dual residuals
-        increase = primal_residual > 10 * dual_residual
-        decrease = dual_residual > 10 * primal_residual
-        scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
-        self = self._replace(rho=self.rho * scale, u=self.u / scale)
+        if adapt_rho := False:  # NOTE: disabled, it seems to not be helping convergence
+            increase = primal_residual > 10 * dual_residual
+            decrease = dual_residual > 10 * primal_residual
+            scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
+            self = self._replace(rho=self.rho * scale, u=self.u / scale)
         return self, primal_ok, dual_ok
 
 
@@ -78,7 +79,7 @@ class GroupLassoLinear(NamedTuple):
         y_train: Float[Array, "n o"],
         l1_penalty: Scalar,
         group_size: int,
-        max_iterations: int = 100,
+        max_iterations: int = 1000,
         tol: Scalar = jnp.array(1e-4),
     ) -> Self:
         n, d_times_g = x_train.shape
@@ -100,7 +101,7 @@ class GroupLassoLinear(NamedTuple):
             new_state = state.x_update(x_train, y_train)
             new_state = new_state.z_and_u_update()
             state, primal_ok, dual_ok = new_state.check_residuals(state, tol)
-            pbar.set_postfix({"rho": (state.rho.min().item(), state.rho.max().item())})
+            pbar.set_postfix({"rho": state.rho.item()})
             if primal_ok.all() and dual_ok.all():
                 print(f"ADMM converged in {iter+1} iterations.")
                 break

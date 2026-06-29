@@ -41,7 +41,7 @@ class InclineRunning:
         feet: Literal["both", "left_only", "right_only"] = "both",
         target: Literal["markers", "forces"] = "markers",
         inclines: Literal["all", "inc0", "inc5", "inc10"] = "all",
-        relative: bool = True,
+        relative: str | None = None,
     ):
         self.path = path
         if feet == "both":
@@ -77,7 +77,6 @@ class InclineRunning:
         valid = (
             ~np.isnan(x).any(axis=1)
             & ~np.isnan(y).any(axis=1)
-            & ((x == 0).sum(axis=-1) < 3)
         )
         x, y = x[valid], y[valid]
 
@@ -87,22 +86,24 @@ class InclineRunning:
         print("train:", self.x_train.shape, self.y_train.shape)
         print("test:", self.x_test.shape, self.y_test.shape)
 
-        # normalize input features
+        # normalize input features; constant columns (e.g. reference marker in relative mode) stay 0
         x_min = np.min(self.x_train, axis=0, keepdims=True)
         x_max = np.max(self.x_train, axis=0, keepdims=True)
-        self.x_train = (self.x_train - x_min) / (x_max - x_min)
-        self.x_test = (self.x_test - x_min) / (x_max - x_min)
+        x_range = np.where(x_max == x_min, 1, x_max - x_min)
+        self.x_train = (self.x_train - x_min) / x_range
+        self.x_test = (self.x_test - x_min) / x_range
 
-        # standardize target variable
+        # standardize target variable; constant columns stay 0
         y_mean = np.mean(self.y_train, axis=0, keepdims=True)
         y_std = np.std(self.y_train, axis=0, keepdims=True)
+        y_std = np.where(y_std == 0, 1, y_std)
         self.y_train = (self.y_train - y_mean) / y_std
         self.y_test = (self.y_test - y_mean) / y_std
 
     def load_marker_data(
         self,
         inclines: Literal["all", "inc0", "inc5", "inc10"] = "all",
-        relative: bool = False,
+        relative: str | None = None,
     ):
         def load_tsv_file(filepath):
             df = pd.read_csv(filepath, sep="\t", skiprows=10)
@@ -119,15 +120,16 @@ class InclineRunning:
             for f in tqdm(files, desc="Loading Marker Data")
         ]
         df = pd.concat(dfs, ignore_index=True)
-        if relative:
+        if relative is not None:
             for prefix in ("L", "R"):
                 for coord in ("X", "Y", "Z"):
-                    # all columns for this foot and coordinate, e.g. LCAL_X, LCUB_X, ...
                     cols = [c for c in df.columns if c.startswith(prefix)]
                     cols = [c for c in cols if c.endswith(coord)]
                     if not cols:
                         continue
-                    df[cols] = df[cols].subtract(df[cols].mean(axis=1), axis=0)
+                    ref_col = f"{prefix}{relative} {coord}"
+                    df[cols] = df[cols].subtract(df[ref_col], axis=0)
+            df = df.drop(columns=[c for c in df.columns if any(c.startswith(f"{p}{relative} ") for p in ("L", "R"))])
         return df
 
     def load_ground_reaction_forces(

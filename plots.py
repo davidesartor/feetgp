@@ -46,13 +46,22 @@ def run_name_from_dir(run_dir: str, results_dir: str) -> str:
     return rel.replace(os.sep, "_")
 
 
+FORCE_LABELS = ["Fx", "Fy", "Fz"]
+
+
 def plot_run(run_dir: str, results_dir: str):
     feet = "both"
     ungrouped = False
+    relative_marker = None
+    target = "markers"
     for part in run_dir.split(os.sep):
         if part.startswith("feet="):
             feet = part.split("=", 1)[1].replace("_ungrouped", "")
             ungrouped = "ungrouped" in part
+        if part.startswith("target="):
+            target = part.split("=", 1)[1]
+        if "relative=" in part:
+            relative_marker = part.split("relative=")[1]
     group_size = 3 if ungrouped or feet != "both" else 6
 
     data = load_run(run_dir)
@@ -65,41 +74,49 @@ def plot_run(run_dir: str, results_dir: str):
     r2          = data["r2"]
     n_groups    = group_norms.shape[1]
 
+    active_markers = [m for m in MARKERS if m != relative_marker]
     if feet == "both":
-        labels = [f"L {m}" for m in MARKERS] + [f"R {m}" for m in MARKERS]
-        group_colors = [COLORS[i % len(COLORS)] for i in range(len(MARKERS))] * 2
+        input_labels = [f"L {m}" for m in active_markers] + [f"R {m}" for m in active_markers]
+        group_colors = [COLORS[i % len(COLORS)] for i in range(len(active_markers))] * 2
     elif feet == "left_only":
-        labels = [f"L {m}" for m in MARKERS]
-        group_colors = [COLORS[i % len(COLORS)] for i in range(len(MARKERS))]
+        input_labels = [f"L {m}" for m in active_markers]
+        group_colors = [COLORS[i % len(COLORS)] for i in range(len(active_markers))]
     else:
-        labels = [f"R {m}" for m in MARKERS]
-        group_colors = [COLORS[i % len(COLORS)] for i in range(len(MARKERS))]
+        input_labels = [f"R {m}" for m in active_markers]
+        group_colors = [COLORS[i % len(COLORS)] for i in range(len(active_markers))]
 
-    r2_per_marker = rearrange(r2, "f (m g) -> f m g", g=group_size).mean(-1)
+    if target == "forces":
+        r2_labels = FORCE_LABELS
+        r2_colors = COLORS[:len(FORCE_LABELS)]
+        r2_summary = r2  # shape (f, 3)
+    else:
+        r2_labels = input_labels
+        r2_colors = group_colors
+        r2_summary = rearrange(r2, "f (m g) -> f m g", g=group_size).mean(-1)
 
     fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=("Group norm per marker", "R² per marker"))
+                        subplot_titles=("Group norm per marker", "R² per output"))
 
     for j in range(n_groups):
         fig.add_trace(go.Scatter(
             x=lambdas,
             y=group_norms[:, j],
             mode="lines",
-            name=labels[j],
+            name=input_labels[j],
             line=dict(color=group_colors[j]),
-            legendgroup=labels[j],
+            legendgroup=input_labels[j],
             showlegend=True,
         ), row=1, col=1)
 
-    for j in range(r2_per_marker.shape[1]):
+    for j in range(r2_summary.shape[1]):
         fig.add_trace(go.Scatter(
             x=lambdas,
-            y=r2_per_marker[:, j],
+            y=r2_summary[:, j],
             mode="lines",
-            name=labels[j],
-            line=dict(color=group_colors[j]),
-            legendgroup=labels[j],
-            showlegend=False,  # legend already shown in left plot
+            name=r2_labels[j],
+            line=dict(color=r2_colors[j]),
+            legendgroup=r2_labels[j],
+            showlegend=True,
         ), row=1, col=2)
 
     fig.update_xaxes(type="log", title_text="λ")

@@ -15,6 +15,7 @@ from linear import GroupLassoLinear
 from inclinerunning import InclineRunning
 
 jax.config.update("jax_enable_x64", True)
+print("JAX devices:", jax.devices())
 
 
 if __name__ == "__main__":
@@ -39,11 +40,13 @@ if __name__ == "__main__":
     # MODELLING ABLATIONS
     parser.add_argument("--linear_model", action="store_true", default=False)
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
+    parser.add_argument("--relative", type=str, default=None)
 
     # OPTIMIZATION ARGS
     parser.add_argument("--maxiter", type=int, default=500)
     parser.add_argument("--tol", type=float, default=1e-3)
     parser.add_argument("--lambda_budget", type=int, default=100)
+    parser.add_argument("--lambda_step", type=float, default=2.0)
     args = parser.parse_args()
 
     group_size = 6 if (args.feet == "both" and not args.ungroup_feet) else 3
@@ -57,6 +60,7 @@ if __name__ == "__main__":
         f"/target={args.target}"
         f"/feet={args.feet}{'_ungrouped' if args.ungroup_feet else ''}"
         f"/inclines={args.inclines}_sub={args.subsample}"
+        f"{f'_relative={args.relative}' if args.relative else ''}"
     )
     save_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -71,6 +75,7 @@ if __name__ == "__main__":
         feet=args.feet,
         target=args.target,
         inclines=args.inclines,
+        relative=args.relative,
     )
 
     x_train = jnp.asarray(data.x_train)
@@ -172,13 +177,13 @@ if __name__ == "__main__":
     warmstart = pivot_admm_state
     lambda_max = lambda_pivot
     for _ in range(args.lambda_budget // 2):
-        lambda_max *= 2
+        lambda_max *= args.lambda_step
         model, warmstart, llk = fit(l1_penalty=lambda_max, warmstart=warmstart)
         gn, r2, n_active = record(lambda_max, model, llk)
         if n_active == 0:
             break
     else:
-        print(f"Failed to find lambda_max with {args.lambda_budget} doublings.")
+        print(f"Failed to find lambda_max with {args.lambda_budget} steps.")
 
     ############################################################
     # Search lambda_min: halve from pivot until full support
@@ -186,10 +191,10 @@ if __name__ == "__main__":
     warmstart = pivot_admm_state
     lambda_min = lambda_pivot
     for _ in range(args.lambda_budget // 2):
-        lambda_min /= 2
+        lambda_min /= args.lambda_step
         model, warmstart, llk = fit(l1_penalty=lambda_min, warmstart=warmstart)
         gn, r2, n_active = record(lambda_min, model, llk)
         if n_active == len(gn):
             break
     else:
-        print(f"Failed to find lambda_min with {args.lambda_budget} halvings.")
+        print(f"Failed to find lambda_min with {args.lambda_budget} steps.")

@@ -1,6 +1,4 @@
-from re import S
 from typing import NamedTuple, Optional, Self
-from cycler import K
 from jaxtyping import Array, Float, Scalar, Bool
 
 import jax
@@ -9,7 +7,9 @@ import jax.scipy as jsp
 import equinox as eqx
 
 from einops import rearrange
-import scipy
+import scipy as sp
+import numpy as np
+from joblib import Parallel, delayed
 from tqdm import tqdm
 
 jax.config.update("jax_enable_x64", True)
@@ -22,8 +22,10 @@ def kernel(
     xs1: Float[Array, "n d"],
     xs2: Float[Array, "m d"],
 ) -> Float[Array, "n m"]:
-    d2 = jnp.sum(theta * (xs1[:, None, :] - xs2[None, :, :]) ** 2, axis=-1)
-    return jnp.exp(-0.5 * d2)
+    def k(x1, x2):
+        return jnp.exp(-0.5 * jnp.sum(theta * (x1 - x2) ** 2))
+
+    return jax.vmap(jax.vmap(k, (None, 0)), (0, None))(xs1, xs2)
 
 
 @jax.jit
@@ -99,7 +101,7 @@ class GLASSOADMMState(NamedTuple):
         )
 
     @staticmethod
-    @jax.jit
+    @eqx.filter_jit
     @jax.value_and_grad
     def admm_x_update_loss(
         x: Float[Array, "d*g+1"],
@@ -111,19 +113,14 @@ class GLASSOADMMState(NamedTuple):
         mask: Float[Array, "d*g"],
     ):
         theta, g = x[:-1], x[-1]
-
-        # used a masked version of lenghtscales for likelihood
         Koo = kernel(theta * mask, x_train, x_train)
         Koo = Koo + g * jnp.eye(len(y_train))
         loglik, _, _ = loglikelihood(Koo, y_train)
-
-        # use different rho for each group, no penalty for g
         target_theta = (z - u)[:-1]
         squared_error = rearrange(
             (theta - target_theta) ** 2, "(d g) -> g d", d=len(rho)
         )
         lagrangian = jnp.sum(0.5 * rho * squared_error)
-
         return -loglik + lagrangian
 
     def x_update(
@@ -132,31 +129,37 @@ class GLASSOADMMState(NamedTuple):
         y_train: Float[Array, "n o"],
         autoregressive: bool,
         maxiter: int = 100,
+        n_jobs: int = -1,
     ) -> Self:
-        new_x = []
-        for i, (x, z, u, y, bmin, bmax) in enumerate(
-            zip(self.x, self.z, self.u, y_train.T, *self.bounds)
-        ):
-            # zero out self referential entries if autoregressive
-            theta_mask = jnp.ones(x_train.shape[-1])
-            if autoregressive:
+        o, _ = self.x.shape
+        _, dg = x_train.shape
+        masks = np.ones((o, dg))
+        if autoregressive:
+            for i in range(o):
                 start = (i // self.group_size) * self.group_size
-                theta_mask = theta_mask.at[start : start + self.group_size].set(0.0)
+                masks[i, start : start + self.group_size] = 0.0
 
-            # optimize with L-BFGS-B
-            res = scipy.optimize.minimize(
+        def solve_one(x, z, u, y, bmin, bmax, mask):
+            x = sp.optimize.minimize(
                 fun=self.admm_x_update_loss,
                 x0=x,
-                args=(z, u, self.rho, x_train, y, theta_mask),
+                args=(z, u, self.rho, x_train, y, mask),
                 jac=True,
                 method="L-BFGS-B",
-                bounds=[(a, b) for a, b in zip(bmin, bmax)],
-                options=dict(maxiter=maxiter, ftol=EPS, gtol=0),
-            )
+                bounds=list(zip(bmin.tolist(), bmax.tolist())),
+                options=dict(maxiter=maxiter, ftol=EPS, gtol=0.0),
+            ).x
+            if autoregressive:
+                x[:-1] *= mask
+            return x
 
-            new_x.append(res.x)
-        new_x = jnp.stack(new_x, axis=0)
-        return self._replace(x=new_x)
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(solve_one)(x, z, u, y, bmin, bmax, mask)
+            for x, z, u, y, bmin, bmax, mask in zip(
+                self.x, self.z, self.u, y_train.T, self.bounds[0], self.bounds[1], masks
+            )
+        )
+        return self._replace(x=jnp.stack([np.array(r) for r in results]))
 
     @eqx.filter_jit
     def z_and_u_update(self) -> Self:
@@ -197,14 +200,14 @@ class GLASSOADMMState(NamedTuple):
         dual_ok = dual_residual < EPS + tol * dual_target
 
         # update rho and u to balance primal and dual residuals
-        increase = primal_residual > 10 * dual_residual
-        decrease = dual_residual > 10 * primal_residual
-        scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
-
-        self = self._replace(
-            rho=self.rho * scale,
-            u=self.u.at[:, :-1].mul(jnp.repeat(1 / scale, self.group_size)),
-        )
+        if adapt_rho := False:  # NOTE: disabled, it seems to not be helping convergence
+            increase = primal_residual > 10 * dual_residual
+            decrease = dual_residual > 10 * primal_residual
+            scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
+            self = self._replace(
+                rho=self.rho * scale,
+                u=self.u.at[:, :-1].mul(jnp.repeat(1 / scale, self.group_size)),
+            )
         return self, primal_ok, dual_ok
 
 
@@ -294,8 +297,8 @@ class GroupLassoGaussianProcess(NamedTuple):
         max_iterations: int = 100,
         tol: Scalar = jnp.array(1e-4),
     ) -> tuple[Self, GLASSOADMMState, Scalar]:
-        n, d_times_g = x_train.shape
-        n, o = y_train.shape
+        _, d_times_g = x_train.shape
+        _, o = y_train.shape
         assert d_times_g % group_size == 0
 
         # get the bounds for the optimization
@@ -314,6 +317,7 @@ class GroupLassoGaussianProcess(NamedTuple):
             else warmstart._replace(
                 rho=l1_penalty * jnp.ones_like(warmstart.rho),
                 l1=l1_penalty,
+                u=jnp.zeros_like(warmstart.u),
             )
         )
 
