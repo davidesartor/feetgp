@@ -42,7 +42,7 @@ class GLASSOADMMState(NamedTuple):
 
     @eqx.filter_jit
     def check_residuals(
-        self, prev: Self, tol: Scalar
+        self, prev: Self, tol: Scalar, adapt_rho: bool = False
     ) -> tuple[Self, Bool[Array, "d"], Bool[Array, "d"]]:
         # check primal
         primal_residual = jnp.linalg.norm(self.x - self.z)
@@ -55,7 +55,7 @@ class GLASSOADMMState(NamedTuple):
         dual_ok = dual_residual < EPS + tol * dual_target
 
         # update rho and u to balance primal and dual residuals
-        if adapt_rho := False:  # NOTE: disabled, it seems to not be helping convergence
+        if adapt_rho:
             increase = primal_residual > 10 * dual_residual
             decrease = dual_residual > 10 * primal_residual
             scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
@@ -81,6 +81,7 @@ class GroupLassoLinear(NamedTuple):
         group_size: int,
         max_iterations: int = 1000,
         tol: Scalar = jnp.array(1e-4),
+        adapt_rho: bool = False,
     ) -> Self:
         n, d_times_g = x_train.shape
         n, o = y_train.shape
@@ -100,7 +101,7 @@ class GroupLassoLinear(NamedTuple):
         for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
             new_state = state.x_update(x_train, y_train)
             new_state = new_state.z_and_u_update()
-            state, primal_ok, dual_ok = new_state.check_residuals(state, tol)
+            state, primal_ok, dual_ok = new_state.check_residuals(state, tol, adapt_rho)
             pbar.set_postfix({"rho": state.rho.item()})
             if primal_ok.all() and dual_ok.all():
                 print(f"ADMM converged in {iter+1} iterations.")

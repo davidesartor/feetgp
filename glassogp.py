@@ -71,6 +71,27 @@ def loglikelihood(
     return (loglik, b, nu)
 
 
+@eqx.filter_jit
+@jax.value_and_grad
+def admm_x_update_loss(
+    x: Float[Array, "d*g+1"],
+    z: Float[Array, "d*g+1"],
+    u: Float[Array, "d*g+1"],
+    rho: Float[Array, "d"],
+    x_train: Float[Array, "n d*g"],
+    y_train: Float[Array, "n"],
+    mask: Float[Array, "d*g"],
+):
+    theta, g = x[:-1], x[-1]
+    Koo = kernel(theta * mask, x_train, x_train)
+    Koo = Koo + g * jnp.eye(len(y_train))
+    loglik, _, _ = loglikelihood(Koo, y_train)
+    target_theta = (z - u)[:-1]
+    squared_error = rearrange((theta - target_theta) ** 2, "(d g) -> g d", d=len(rho))
+    lagrangian = jnp.sum(0.5 * rho * squared_error)
+    return -loglik + lagrangian
+
+
 class GLASSOADMMState(NamedTuple):
     x: Float[Array, "o d*g+1"]
     z: Float[Array, "o d*g+1"]
@@ -100,29 +121,6 @@ class GLASSOADMMState(NamedTuple):
             bounds=bounds,
         )
 
-    @staticmethod
-    @eqx.filter_jit
-    @jax.value_and_grad
-    def admm_x_update_loss(
-        x: Float[Array, "d*g+1"],
-        z: Float[Array, "d*g+1"],
-        u: Float[Array, "d*g+1"],
-        rho: Float[Array, "d"],
-        x_train: Float[Array, "n d*g"],
-        y_train: Float[Array, "n"],
-        mask: Float[Array, "d*g"],
-    ):
-        theta, g = x[:-1], x[-1]
-        Koo = kernel(theta * mask, x_train, x_train)
-        Koo = Koo + g * jnp.eye(len(y_train))
-        loglik, _, _ = loglikelihood(Koo, y_train)
-        target_theta = (z - u)[:-1]
-        squared_error = rearrange(
-            (theta - target_theta) ** 2, "(d g) -> g d", d=len(rho)
-        )
-        lagrangian = jnp.sum(0.5 * rho * squared_error)
-        return -loglik + lagrangian
-
     def x_update(
         self,
         x_train: Float[Array, "n d*g"],
@@ -139,25 +137,38 @@ class GLASSOADMMState(NamedTuple):
                 start = (i // self.group_size) * self.group_size
                 masks[i, start : start + self.group_size] = 0.0
 
-        def solve_one(x, z, u, y, bmin, bmax, mask):
-            x = sp.optimize.minimize(
-                fun=self.admm_x_update_loss,
-                x0=x,
-                args=(z, u, self.rho, x_train, y, mask),
+        devices = jax.devices()
+        n_devices = len(devices)
+        x_train_per_dev = [jax.device_put(x_train, d) for d in devices]
+        rho_per_dev = [jax.device_put(self.rho, d) for d in devices]
+
+        def solve_one(i, x, z, u, y, bmin, bmax, mask):
+            dev = devices[i % n_devices]
+            result = sp.optimize.minimize(
+                fun=admm_x_update_loss,
+                x0=np.array(x),
+                args=(
+                    jax.device_put(z, dev),
+                    jax.device_put(u, dev),
+                    rho_per_dev[i % n_devices],
+                    x_train_per_dev[i % n_devices],
+                    jax.device_put(y, dev),
+                    jax.device_put(jnp.asarray(mask), dev),
+                ),
                 jac=True,
                 method="L-BFGS-B",
                 bounds=list(zip(bmin.tolist(), bmax.tolist())),
                 options=dict(maxiter=maxiter, ftol=EPS, gtol=0.0),
             ).x
             if autoregressive:
-                x[:-1] *= mask
-            return x
+                result[:-1] *= mask
+            return result
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(solve_one)(x, z, u, y, bmin, bmax, mask)
-            for x, z, u, y, bmin, bmax, mask in zip(
+            delayed(solve_one)(i, x, z, u, y, bmin, bmax, mask)
+            for i, (x, z, u, y, bmin, bmax, mask) in enumerate(zip(
                 self.x, self.z, self.u, y_train.T, self.bounds[0], self.bounds[1], masks
-            )
+            ))
         )
         return self._replace(x=jnp.stack([np.array(r) for r in results]))
 
@@ -183,7 +194,7 @@ class GLASSOADMMState(NamedTuple):
 
     @eqx.filter_jit
     def check_residuals(
-        self, prev: Self, tol: Scalar
+        self, prev: Self, tol: Scalar, adapt_rho: bool = False
     ) -> tuple[Self, Bool[Array, "d"], Bool[Array, "d"]]:
         def grouped_norm(x: Float[Array, "o d*g+1"]) -> Float[Array, "d"]:
             x = rearrange(x[..., :-1], "o (d g) -> d (o g)", g=self.group_size)
@@ -200,7 +211,7 @@ class GLASSOADMMState(NamedTuple):
         dual_ok = dual_residual < EPS + tol * dual_target
 
         # update rho and u to balance primal and dual residuals
-        if adapt_rho := False:  # NOTE: disabled, it seems to not be helping convergence
+        if adapt_rho:
             increase = primal_residual > 10 * dual_residual
             decrease = dual_residual > 10 * primal_residual
             scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
@@ -296,7 +307,9 @@ class GroupLassoGaussianProcess(NamedTuple):
         g_range: tuple[float, float] = (EPS, 1.0),
         max_iterations: int = 100,
         tol: Scalar = jnp.array(1e-4),
-    ) -> tuple[Self, GLASSOADMMState, Scalar]:
+        adapt_rho: bool = False,
+        n_jobs: int = -1,
+    ) -> tuple[Self, GLASSOADMMState, Scalar, int]:
         _, d_times_g = x_train.shape
         _, o = y_train.shape
         assert d_times_g % group_size == 0
@@ -321,16 +334,18 @@ class GroupLassoGaussianProcess(NamedTuple):
             )
         )
 
+        n_iters = max_iterations
         for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
-            new_state = state.x_update(x_train, y_train, autoregressive)
+            new_state = state.x_update(x_train, y_train, autoregressive, n_jobs=n_jobs)
             new_state = new_state.z_and_u_update()
-            state, primal_ok, dual_ok = new_state.check_residuals(state, tol)
+            state, primal_ok, dual_ok = new_state.check_residuals(state, tol, adapt_rho)
             pbar.set_postfix({"rho": (state.rho.min().item(), state.rho.max().item())})
             if primal_ok.all() and dual_ok.all():
-                print(f"ADMM converged in {iter+1} iterations.")
+                n_iters = iter + 1
+                print(f"ADMM converged in {n_iters} iterations.")
                 break
         else:
             print("ADMM did not converge within the maximum number of iterations.")
 
         self, llk = cls.unpack_parameters(state.x, x_train, y_train)
-        return self, state, llk
+        return self, state, llk, n_iters

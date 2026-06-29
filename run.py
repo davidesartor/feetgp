@@ -45,6 +45,8 @@ if __name__ == "__main__":
     # OPTIMIZATION ARGS
     parser.add_argument("--maxiter", type=int, default=500)
     parser.add_argument("--tol", type=float, default=1e-3)
+    parser.add_argument("--adapt_rho", action="store_true", default=False)
+    parser.add_argument("--n_jobs", type=int, default=-1)
     parser.add_argument("--lambda_budget", type=int, default=100)
     parser.add_argument("--lambda_step", type=float, default=2.0)
     args = parser.parse_args()
@@ -95,10 +97,11 @@ if __name__ == "__main__":
                 group_size=group_size,
                 max_iterations=args.maxiter,
                 tol=jnp.array(args.tol),
+                adapt_rho=args.adapt_rho,
             )
             return model, None, None
         else:
-            return GroupLassoGaussianProcess.fit(
+            model, state, llk, _ = GroupLassoGaussianProcess.fit(
                 x_train=x_train,
                 y_train=y_train,
                 l1_penalty=jnp.array(l1_penalty),
@@ -107,7 +110,10 @@ if __name__ == "__main__":
                 warmstart=warmstart,
                 max_iterations=args.maxiter,
                 tol=jnp.array(args.tol),
+                adapt_rho=args.adapt_rho,
+                n_jobs=args.n_jobs,
             )
+            return model, state, llk
 
     def group_norms(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
