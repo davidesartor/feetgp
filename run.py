@@ -49,6 +49,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_jobs", type=int, default=-1)
     parser.add_argument("--lambda_budget", type=int, default=100)
     parser.add_argument("--lambda_step", type=float, default=2.0)
+    # by default an existing lambda pickle is reused (resume); --overwrite refits
+    parser.add_argument("--overwrite", action="store_true", default=False)
     args = parser.parse_args()
 
     group_size = 6 if (args.feet == "both" and not args.ungroup_feet) else 3
@@ -132,11 +134,16 @@ if __name__ == "__main__":
         r2 = np.array([r2_score(y[:, j], y_pred[j, :]) for j in range(o)])
         return r2
 
+    def lambda_path(l1_penalty: float) -> str:
+        # zero-padded fixed-point filename so lexical order matches numeric order
+        return os.path.join(save_dir, f"lambda={float(l1_penalty):013.6f}.pkl")
+
     def record(
         l1_penalty: float,
         model: GroupLassoGaussianProcess | GroupLassoLinear,
+        state,
         llk: Scalar | None,
-    ):
+    ) -> dict:
         gn = group_norms(model)
         r2 = r2_scores(model, x_test, y_test)
         r2_train = r2_scores(model, x_train, y_train)
@@ -147,38 +154,63 @@ if __name__ == "__main__":
         print(f"    r2 (test)  = [{r2.min():.3f}, {r2.max():.3f}]")
         print(f"    r2 (train) = [{r2_train.min():.3f}, {r2_train.max():.3f}]")
 
-        fname = f"lambda={l1_penalty:.6e}.pkl"
-        with open(os.path.join(save_dir, fname), "wb") as f:
-            results = dict(
-                l1_penalty=float(l1_penalty),
-                model=(
-                    model
-                    if isinstance(model, GroupLassoLinear)
-                    else model._replace(x_train=None, y_train=None)
-                ),
-                group_norms=gn,
-                r2=r2,
-                r2_train=r2_train,
-                llk=float(llk) if llk is not None else None,
-                n_active=n_active,
-            )
+        results = dict(
+            l1_penalty=float(l1_penalty),
+            model=(
+                model
+                if isinstance(model, GroupLassoLinear)
+                else model._replace(x_train=None, y_train=None)
+            ),
+            # ADMM warmstart state (None for the linear model); persisted so a
+            # killed run can resume the lambda sweep with a warm start.
+            admm_state=state,
+            group_norms=gn,
+            r2=r2,
+            r2_train=r2_train,
+            llk=float(llk) if llk is not None else None,
+            n_active=n_active,
+        )
+        # atomic write: a crash mid-dump can't leave a truncated pickle behind
+        path = lambda_path(l1_penalty)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
             pickle.dump(results, f)
-        return gn, r2, n_active
+        os.replace(tmp, path)
+        return results
+
+    def fit_or_load(l1_penalty: float, warmstart=None) -> tuple[dict, object]:
+        """Fit at l1_penalty, or reuse a previously saved result to resume a run.
+
+        Returns the results dict and the ADMM state to warmstart the next fit.
+        """
+        path = lambda_path(l1_penalty)
+        if not args.overwrite and os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    results = pickle.load(f)
+                n_active = results["n_active"]
+                n_groups = len(results["group_norms"])
+                print(f"lambda = {l1_penalty:.4g} (cached, resuming)")
+                print(f"    active groups = {n_active}/{n_groups}")
+                return results, results.get("admm_state")
+            except Exception as e:
+                # a run killed mid-write can leave a truncated pickle; refit it
+                print(f"lambda = {l1_penalty:.4g}: corrupt cache ({e}), refitting")
+        model, state, llk = fit(l1_penalty, warmstart=warmstart)
+        results = record(l1_penalty, model, state, llk)
+        return results, state
 
     ############################################################
     # Probe lambda_max: unpenalized fit gives upper bound on group norms
     ############################################################
-    unpenalized_model, unpenalized_admm, llk = fit(l1_penalty=0.0, warmstart=None)
-    gn, r2, max_active_groups = record(0.0, unpenalized_model, llk)
+    results, unpenalized_admm = fit_or_load(0.0, warmstart=None)
+    gn = results["group_norms"]
 
     ############################################################
     # Pivot: lambda where penalty term balances the negative log-likelihood
     ############################################################
     lambda_pivot = 1 / gn.sum()
-    pivot_model, pivot_admm_state, llk = fit(
-        l1_penalty=lambda_pivot, warmstart=unpenalized_admm
-    )
-    gn, r2, active_groups = record(lambda_pivot, pivot_model, llk)
+    results, pivot_admm_state = fit_or_load(lambda_pivot, warmstart=unpenalized_admm)
 
     ############################################################
     # Search lambda_max: double from pivot until all groups die
@@ -187,9 +219,8 @@ if __name__ == "__main__":
     lambda_max = lambda_pivot
     for _ in range(args.lambda_budget // 2):
         lambda_max *= args.lambda_step
-        model, warmstart, llk = fit(l1_penalty=lambda_max, warmstart=warmstart)
-        gn, r2, n_active = record(lambda_max, model, llk)
-        if n_active == 0:
+        results, warmstart = fit_or_load(lambda_max, warmstart=warmstart)
+        if results["n_active"] == 0:
             break
     else:
         print(f"Failed to find lambda_max with {args.lambda_budget} steps.")
@@ -201,9 +232,8 @@ if __name__ == "__main__":
     lambda_min = lambda_pivot
     for _ in range(args.lambda_budget // 2):
         lambda_min /= args.lambda_step
-        model, warmstart, llk = fit(l1_penalty=lambda_min, warmstart=warmstart)
-        gn, r2, n_active = record(lambda_min, model, llk)
-        if n_active == len(gn):
+        results, warmstart = fit_or_load(lambda_min, warmstart=warmstart)
+        if results["n_active"] == len(results["group_norms"]):
             break
     else:
         print(f"Failed to find lambda_min with {args.lambda_budget} steps.")

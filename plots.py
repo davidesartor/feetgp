@@ -137,8 +137,13 @@ def plot_run(run_dir: str, results_dir: str):
         ), row=1, col=2)
         train_trace_indices.append(len(fig.data) - 1)
 
+    # group-norm y-axis: fix the floor at 1e-5, let the top autorange to the data
+    gmax = np.nanmax(group_norms) if group_norms.size else 1.0
+    gmax = float(gmax) if np.isfinite(gmax) and gmax > 0 else 1.0
+    gnorm_range = [-5, np.log10(gmax) + 0.15]  # log10 units
+
     fig.update_xaxes(type="log", title_text="λ")
-    fig.update_yaxes(type="log", title_text="group norm", row=1, col=1)
+    fig.update_yaxes(type="log", range=gnorm_range, title_text="group norm", row=1, col=1)
     fig.update_yaxes(range=[-0.05, 1.05], title_text="R²", row=1, col=2)
     fig.update_layout(
         width=1200,
