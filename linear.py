@@ -43,7 +43,7 @@ class GLASSOADMMState(NamedTuple):
     @eqx.filter_jit
     def check_residuals(
         self, prev: Self, tol: Scalar, adapt_rho: bool = False
-    ) -> tuple[Self, Bool[Array, "d"], Bool[Array, "d"]]:
+    ) -> tuple[Self, Bool[Array, ""], Bool[Array, ""]]:
         # check primal
         primal_residual = jnp.linalg.norm(self.x - self.z)
         primal_target = jnp.maximum(jnp.linalg.norm(prev.x), jnp.linalg.norm(prev.z))
@@ -81,7 +81,7 @@ class GroupLassoLinear(NamedTuple):
         group_size: int,
         max_iterations: int = 1000,
         tol: Scalar = jnp.array(1e-4),
-        adapt_rho: bool = False,
+        adapt_rho: bool = True,
     ) -> Self:
         n, d_times_g = x_train.shape
         n, o = y_train.shape
@@ -92,7 +92,7 @@ class GroupLassoLinear(NamedTuple):
             x=jnp.zeros((o, d_times_g)),
             z=jnp.zeros((o, d_times_g)),
             u=jnp.zeros((o, d_times_g)),
-            rho=l1_penalty,
+            rho=jnp.array(1.0),
             l1=l1_penalty,
             group_size=group_size,
         )

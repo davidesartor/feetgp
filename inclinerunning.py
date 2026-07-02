@@ -127,9 +127,16 @@ class InclineRunning:
                     cols = [c for c in cols if c.endswith(coord)]
                     if not cols:
                         continue
-                    ref_col = f"{prefix}{relative} {coord}"
-                    df[cols] = df[cols].subtract(df[ref_col], axis=0)
-            df = df.drop(columns=[c for c in df.columns if any(c.startswith(f"{p}{relative} ") for p in ("L", "R"))])
+                    if relative == "midpoint":
+                        # reference is the midpoint between the LMAL and MMAL markers
+                        ref = (df[f"{prefix}LMAL {coord}"] + df[f"{prefix}MMAL {coord}"]) / 2
+                    else:
+                        ref = df[f"{prefix}{relative} {coord}"]
+                    df[cols] = df[cols].subtract(ref, axis=0)
+            if relative != "midpoint":
+                # drop the reference marker (now identically zero); the midpoint
+                # is not a marker column, so nothing is dropped in that mode
+                df = df.drop(columns=[c for c in df.columns if any(c.startswith(f"{p}{relative} ") for p in ("L", "R"))])
         return df
 
     def load_ground_reaction_forces(

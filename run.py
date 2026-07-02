@@ -40,12 +40,12 @@ if __name__ == "__main__":
     # MODELLING ABLATIONS
     parser.add_argument("--linear_model", action="store_true", default=False)
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
-    parser.add_argument("--relative", type=str, default=None)
+    # pass --relative alone for the LMAL/MMAL midpoint, or --relative MARKER for a specific marker
+    parser.add_argument("--relative", type=str, nargs="?", default=None, const="midpoint")
 
     # OPTIMIZATION ARGS
     parser.add_argument("--maxiter", type=int, default=500)
     parser.add_argument("--tol", type=float, default=1e-3)
-    parser.add_argument("--adapt_rho", action="store_true", default=False)
     parser.add_argument("--n_jobs", type=int, default=-1)
     parser.add_argument("--lambda_budget", type=int, default=100)
     parser.add_argument("--lambda_step", type=float, default=2.0)
@@ -97,11 +97,10 @@ if __name__ == "__main__":
                 group_size=group_size,
                 max_iterations=args.maxiter,
                 tol=jnp.array(args.tol),
-                adapt_rho=args.adapt_rho,
             )
             return model, None, None
         else:
-            model, state, llk, _ = GroupLassoGaussianProcess.fit(
+            model, state, llk = GroupLassoGaussianProcess.fit(
                 x_train=x_train,
                 y_train=y_train,
                 l1_penalty=jnp.array(l1_penalty),
@@ -110,7 +109,6 @@ if __name__ == "__main__":
                 warmstart=warmstart,
                 max_iterations=args.maxiter,
                 tol=jnp.array(args.tol),
-                adapt_rho=args.adapt_rho,
                 n_jobs=args.n_jobs,
             )
             return model, state, llk
@@ -127,9 +125,11 @@ if __name__ == "__main__":
 
     def r2_scores(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
+        x: Float[NDArray, "m d"],
+        y: Float[NDArray, "m o"],
     ) -> Float[NDArray, "o"]:
-        y_pred = np.array(model.predict(x_test))
-        r2 = np.array([r2_score(y_test[:, j], y_pred[j, :]) for j in range(o)])
+        y_pred = np.array(model.predict(x))
+        r2 = np.array([r2_score(y[:, j], y_pred[j, :]) for j in range(o)])
         return r2
 
     def record(
@@ -138,12 +138,14 @@ if __name__ == "__main__":
         llk: Scalar | None,
     ):
         gn = group_norms(model)
-        r2 = r2_scores(model)
+        r2 = r2_scores(model, x_test, y_test)
+        r2_train = r2_scores(model, x_train, y_train)
         n_active = int(np.sum(gn > 1e-8))
         print(f"lambda = {l1_penalty:.4g}")
         print(f"    active groups = {n_active}/{len(gn)}")
         print(f"    max gnorm = {gn.max():.4f}")
-        print(f"    r2 = [{r2.min():.3f}, {r2.max():.3f}]")
+        print(f"    r2 (test)  = [{r2.min():.3f}, {r2.max():.3f}]")
+        print(f"    r2 (train) = [{r2_train.min():.3f}, {r2_train.max():.3f}]")
 
         fname = f"lambda={l1_penalty:.6e}.pkl"
         with open(os.path.join(save_dir, fname), "wb") as f:
@@ -156,6 +158,7 @@ if __name__ == "__main__":
                 ),
                 group_norms=gn,
                 r2=r2,
+                r2_train=r2_train,
                 llk=float(llk) if llk is not None else None,
                 n_active=n_active,
             )

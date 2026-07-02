@@ -28,16 +28,20 @@ def load_run(run_dir: str) -> dict | None:
     for f in files:
         with open(f, "rb") as fp:
             r = pickle.load(fp)
+        r2 = np.asarray(r["r2"])
+        r2_train = np.asarray(r["r2_train"]) if "r2_train" in r else np.full_like(r2, np.nan)
         results.append({
             "l1_penalty": r["l1_penalty"],
             "group_norms": np.asarray(r["group_norms"]),
-            "r2":          np.asarray(r["r2"]),
+            "r2":          r2,
+            "r2_train":    r2_train,
         })
     results.sort(key=lambda r: r["l1_penalty"])
     return {
         "lambdas":     np.array([r["l1_penalty"] for r in results]),
         "group_norms": np.stack([r["group_norms"] for r in results]),
         "r2":          np.stack([r["r2"] for r in results]),
+        "r2_train":    np.stack([r["r2_train"] for r in results]),
     }
 
 
@@ -72,6 +76,7 @@ def plot_run(run_dir: str, results_dir: str):
     lambdas     = data["lambdas"]
     group_norms = data["group_norms"]
     r2          = data["r2"]
+    r2_train    = data["r2_train"]
     n_groups    = group_norms.shape[1]
 
     active_markers = [m for m in MARKERS if m != relative_marker]
@@ -89,10 +94,12 @@ def plot_run(run_dir: str, results_dir: str):
         r2_labels = FORCE_LABELS
         r2_colors = COLORS[:len(FORCE_LABELS)]
         r2_summary = r2  # shape (f, 3)
+        r2_train_summary = r2_train
     else:
         r2_labels = input_labels
         r2_colors = group_colors
         r2_summary = rearrange(r2, "f (m g) -> f m g", g=group_size).mean(-1)
+        r2_train_summary = rearrange(r2_train, "f (m g) -> f m g", g=group_size).mean(-1)
 
     fig = make_subplots(rows=1, cols=2,
                         subplot_titles=("Group norm per marker", "R² per output"))
@@ -108,6 +115,7 @@ def plot_run(run_dir: str, results_dir: str):
             showlegend=True,
         ), row=1, col=1)
 
+    train_trace_indices = []
     for j in range(r2_summary.shape[1]):
         fig.add_trace(go.Scatter(
             x=lambdas,
@@ -118,6 +126,16 @@ def plot_run(run_dir: str, results_dir: str):
             legendgroup=r2_labels[j],
             showlegend=True,
         ), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=lambdas,
+            y=r2_train_summary[:, j],
+            mode="lines",
+            name=f"{r2_labels[j]} (train)",
+            line=dict(color=r2_colors[j], dash="dot"),
+            legendgroup=r2_labels[j],
+            showlegend=False,
+        ), row=1, col=2)
+        train_trace_indices.append(len(fig.data) - 1)
 
     fig.update_xaxes(type="log", title_text="λ")
     fig.update_yaxes(type="log", title_text="group norm", row=1, col=1)
@@ -126,6 +144,16 @@ def plot_run(run_dir: str, results_dir: str):
         width=1200,
         height=500,
         legend=dict(font=dict(size=10), tracegroupgap=0),
+        updatemenus=[dict(
+            type="buttons",
+            direction="left",
+            x=1.0, y=1.12, xanchor="right", yanchor="bottom",
+            buttons=[
+                dict(label="Toggle train", method="restyle",
+                     args=[{"visible": "legendonly"}, train_trace_indices],
+                     args2=[{"visible": True}, train_trace_indices]),
+            ],
+        )],
     )
 
     name = run_name_from_dir(run_dir, results_dir)
