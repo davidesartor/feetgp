@@ -96,21 +96,55 @@ def loglikelihood(
 
 @eqx.filter_jit
 @jax.value_and_grad
-def admm_x_update_loss(
-    x: Float[Array, "d*g+1"],
+def admm_theta_update_loss(
+    theta: Float[Array, "d*g"],
+    g: Scalar,
     z: Float[Array, "d*g+1"],
     u: Float[Array, "d*g+1"],
     rho: Scalar,
     x_train: Float[Array, "n d*g"],
     y_train: Float[Array, "n"],
 ):
-    theta, g = x[:-1], x[-1]
+    # theta-only step of the x-update: optimize the lengthscales with the nugget g
+    # held fixed. Gradient (via value_and_grad) is w.r.t. theta.
     Koo = kernel(theta, x_train, x_train)
     Koo = Koo + g * jnp.eye(len(y_train))
     loglik, _, _ = loglikelihood(Koo, y_train)
     target_theta = (z - u)[:-1]
     lagrangian = 0.5 * rho * jnp.sum((theta - target_theta) ** 2)
     return -loglik + lagrangian
+
+
+@eqx.filter_jit
+def admm_g_update_loss(
+    g: Scalar,
+    theta: Float[Array, "d*g"],
+    x_train: Float[Array, "n d*g"],
+    y_train: Float[Array, "n"],
+) -> Scalar:
+    # g-only step of the x-update: optimize the nugget with the lengthscales theta
+    # held fixed. g carries no group-lasso penalty, so this is just -loglik and is a
+    # 1D bounded problem. Used for the grid probe (value only).
+    Koo = kernel(theta, x_train, x_train)
+    Koo = Koo + g * jnp.eye(len(y_train))
+    loglik, _, _ = loglikelihood(Koo, y_train)
+    return -loglik
+
+
+@eqx.filter_jit
+@jax.value_and_grad
+def admm_g_update_loss_and_grad(
+    g: Float[Array, "1"],
+    theta: Float[Array, "d*g"],
+    x_train: Float[Array, "n d*g"],
+    y_train: Float[Array, "n"],
+) -> Scalar:
+    # same objective as admm_g_update_loss, but returns (value, grad) for the
+    # gradient-based local polish started from the best grid point.
+    Koo = kernel(theta, x_train, x_train)
+    Koo = Koo + g[0] * jnp.eye(len(y_train))
+    loglik, _, _ = loglikelihood(Koo, y_train)
+    return -loglik
 
 
 class GLASSOADMMState(NamedTuple):
@@ -147,6 +181,7 @@ class GLASSOADMMState(NamedTuple):
         autoregressive: bool,
         maxiter: int = 1000,
         n_jobs: int = -1,
+        g_grid_size: int = 15,
     ) -> Self:
         def solve_ith_output(i):
             x_train_i = np.array(x_train)
@@ -155,16 +190,48 @@ class GLASSOADMMState(NamedTuple):
                 start = (i // self.group_size) * self.group_size
                 x_train_i[:, start : start + self.group_size] = 0.0
 
-            new_x = sp.optimize.minimize(
-                fun=admm_x_update_loss,
-                x0=self.x[i],
-                args=(self.z[i], self.u[i], self.rho, x_train_i, y_train[:, i]),
+            y_train_i = y_train[:, i]
+            theta0 = self.x[i][:-1]
+            g0 = self.x[i][-1]
+
+            # ---- Step 1: optimize theta (lengthscales), g fixed -------------------
+            theta_bounds = list(
+                zip(self.bounds[0, i, :-1], self.bounds[1, i, :-1])
+            )
+            new_theta = sp.optimize.minimize(
+                fun=admm_theta_update_loss,
+                x0=theta0,
+                args=(g0, self.z[i], self.u[i], self.rho, x_train_i, y_train_i),
                 jac=True,
                 method="L-BFGS-B",
-                bounds=list(zip(self.bounds[0, i], self.bounds[1, i])),
+                bounds=theta_bounds,
                 options=dict(maxiter=maxiter, ftol=EPS, gtol=0.0),
             ).x
-            return new_x
+            new_theta = jnp.asarray(new_theta)
+
+            # ---- Step 2: optimize g (nugget), theta fixed -------------------------
+            # grid-probe the (log-spaced) range for the best g, then run a
+            # gradient-based local polish over the full range from that point.
+            g_lo = float(self.bounds[0, i, -1])
+            g_hi = float(self.bounds[1, i, -1])
+            g_grid = jnp.geomspace(g_lo, g_hi, g_grid_size)
+            grid_losses = jax.vmap(
+                lambda g: admm_g_update_loss(
+                    g, new_theta, jnp.asarray(x_train_i), y_train_i
+                )
+            )(g_grid)
+            g_best = float(g_grid[int(jnp.argmin(grid_losses))])
+            new_g = sp.optimize.minimize(
+                fun=admm_g_update_loss_and_grad,
+                x0=np.array([g_best]),
+                args=(new_theta, x_train_i, y_train_i),
+                jac=True,
+                method="L-BFGS-B",
+                bounds=[(g_lo, g_hi)],
+                options=dict(maxiter=maxiter, ftol=EPS, gtol=0.0),
+            ).x[0]
+
+            return np.concatenate([np.asarray(new_theta), [new_g]])
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(solve_ith_output)(i) for i in range(len(self.x))
@@ -300,7 +367,7 @@ class GroupLassoGaussianProcess(NamedTuple):
         autoregressive: bool = True,
         *,
         warmstart: Optional[GLASSOADMMState] = None,
-        g_range: tuple[float, float] = (1e-4, 1.0),
+        g_range: tuple[float, float] = (EPS, 1.0),
         g_init: float = 0.1,
         max_iterations: int = 100,
         tol: Scalar = jnp.array(1e-4),
