@@ -7,8 +7,9 @@ import jax.scipy as jsp
 import equinox as eqx
 
 from einops import rearrange
-import scipy as sp
 import numpy as np
+import scipy as sp
+from scipy.spatial.distance import cdist
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
@@ -23,9 +24,31 @@ def kernel(
     xs2: Float[Array, "m d"],
 ) -> Float[Array, "n m"]:
     def k(x1, x2):
-        return jnp.exp(-0.5 * jnp.sum(theta * (x1 - x2) ** 2))
+        return jnp.exp(-0.5 * jnp.sum(theta**2 * (x1 - x2) ** 2))
 
     return jax.vmap(jax.vmap(k, (None, 0)), (0, None))(xs1, xs2)
+
+
+def hetgpy_auto_bounds(
+    x: Float[Array, "n d"],
+    min_cor: float = 0.01,
+    max_cor: float = 0.5,
+) -> tuple[Float[np.ndarray, "d"], Float[np.ndarray, "d"]]:
+    # rescale each input dimension to [0, 1] (constant columns are left untouched)
+    x = np.asarray(x)
+    x_min, x_max = x.min(axis=0), x.max(axis=0)
+    x_span = np.where(x_max > x_min, x_max - x_min, 1.0)
+    x = (x - x_min) / x_span
+
+    # pairwise squared distances, keeping only the strictly-lower nonzero pairs
+    dists = cdist(x, x, metric="sqeuclidean")
+    dists = dists[np.tril(dists, k=-1) > 0]
+
+    # hetgpy heuristic: pick lengthscales so the given distance quantiles map to
+    # the target correlations min_cor (short) and max_cor (long)
+    lower = -np.quantile(dists, 0.05) / np.log(min_cor) * x_span**2
+    upper = -np.quantile(dists, 0.95) / np.log(max_cor) * x_span**2
+    return lower, upper
 
 
 @jax.jit
@@ -77,18 +100,16 @@ def admm_x_update_loss(
     x: Float[Array, "d*g+1"],
     z: Float[Array, "d*g+1"],
     u: Float[Array, "d*g+1"],
-    rho: Float[Array, "d"],
+    rho: Scalar,
     x_train: Float[Array, "n d*g"],
     y_train: Float[Array, "n"],
-    mask: Float[Array, "d*g"],
 ):
     theta, g = x[:-1], x[-1]
-    Koo = kernel(theta * mask, x_train, x_train)
+    Koo = kernel(theta, x_train, x_train)
     Koo = Koo + g * jnp.eye(len(y_train))
     loglik, _, _ = loglikelihood(Koo, y_train)
     target_theta = (z - u)[:-1]
-    squared_error = rearrange((theta - target_theta) ** 2, "(d g) -> g d", d=len(rho))
-    lagrangian = jnp.sum(0.5 * rho * squared_error)
+    lagrangian = 0.5 * rho * jnp.sum((theta - target_theta) ** 2)
     return -loglik + lagrangian
 
 
@@ -96,7 +117,7 @@ class GLASSOADMMState(NamedTuple):
     x: Float[Array, "o d*g+1"]
     z: Float[Array, "o d*g+1"]
     u: Float[Array, "o d*g+1"]
-    rho: Float[Array, "d"]
+    rho: Scalar
     l1: Scalar
     group_size: int
     bounds: Float[Array, "2 o d*g+1"]
@@ -105,17 +126,15 @@ class GLASSOADMMState(NamedTuple):
     def initialize(
         cls,
         bounds: Float[Array, "2 o d*g+1"],
+        x0: Float[Array, "o d*g+1"],
         penalty: Scalar,
         group_size: int,
     ) -> Self:
-        d = (bounds.shape[-1] - 1) // group_size
-        vmin, vmax = bounds
-        x0 = 0.1 * vmax + 0.9 * vmin
         return cls(
             x=x0,
             z=x0,
             u=jnp.zeros_like(x0),
-            rho=penalty * jnp.ones((d,)),
+            rho=jnp.array(1.0),
             l1=penalty,
             group_size=group_size,
             bounds=bounds,
@@ -126,51 +145,36 @@ class GLASSOADMMState(NamedTuple):
         x_train: Float[Array, "n d*g"],
         y_train: Float[Array, "n o"],
         autoregressive: bool,
-        maxiter: int = 100,
+        maxiter: int = 1000,
         n_jobs: int = -1,
     ) -> Self:
-        o, _ = self.x.shape
-        _, dg = x_train.shape
-        masks = np.ones((o, dg))
-        if autoregressive:
-            for i in range(o):
+        def solve_ith_output(i):
+            x_train_i = np.array(x_train)
+            if autoregressive:
+                # zero out the group corresponding to the i-th output in the training data
                 start = (i // self.group_size) * self.group_size
-                masks[i, start : start + self.group_size] = 0.0
+                x_train_i[:, start : start + self.group_size] = 0.0
 
-        devices = jax.devices()
-        n_devices = len(devices)
-        x_train_per_dev = [jax.device_put(x_train, d) for d in devices]
-        rho_per_dev = [jax.device_put(self.rho, d) for d in devices]
-
-        def solve_one(i, x, z, u, y, bmin, bmax, mask):
-            dev = devices[i % n_devices]
-            result = sp.optimize.minimize(
+            new_x = sp.optimize.minimize(
                 fun=admm_x_update_loss,
-                x0=np.array(x),
-                args=(
-                    jax.device_put(z, dev),
-                    jax.device_put(u, dev),
-                    rho_per_dev[i % n_devices],
-                    x_train_per_dev[i % n_devices],
-                    jax.device_put(y, dev),
-                    jax.device_put(jnp.asarray(mask), dev),
-                ),
+                x0=self.x[i],
+                args=(self.z[i], self.u[i], self.rho, x_train_i, y_train[:, i]),
                 jac=True,
                 method="L-BFGS-B",
-                bounds=list(zip(bmin.tolist(), bmax.tolist())),
+                bounds=list(zip(self.bounds[0, i], self.bounds[1, i])),
                 options=dict(maxiter=maxiter, ftol=EPS, gtol=0.0),
             ).x
-            if autoregressive:
-                result[:-1] *= mask
-            return result
+            return new_x
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(solve_one)(i, x, z, u, y, bmin, bmax, mask)
-            for i, (x, z, u, y, bmin, bmax, mask) in enumerate(zip(
-                self.x, self.z, self.u, y_train.T, self.bounds[0], self.bounds[1], masks
-            ))
+            delayed(solve_ith_output)(i) for i in range(len(self.x))
         )
-        return self._replace(x=jnp.stack([np.array(r) for r in results]))
+        new_x = np.stack([np.array(r) for r in results])
+        if autoregressive:
+            for i in range(len(self.x)):
+                start = (i // self.group_size) * self.group_size
+                new_x[i, start : start + self.group_size] = 0.0
+        return self._replace(x=jnp.array(new_x))
 
     @eqx.filter_jit
     def z_and_u_update(self) -> Self:
@@ -195,19 +199,15 @@ class GLASSOADMMState(NamedTuple):
     @eqx.filter_jit
     def check_residuals(
         self, prev: Self, tol: Scalar, adapt_rho: bool = False
-    ) -> tuple[Self, Bool[Array, "d"], Bool[Array, "d"]]:
-        def grouped_norm(x: Float[Array, "o d*g+1"]) -> Float[Array, "d"]:
-            x = rearrange(x[..., :-1], "o (d g) -> d (o g)", g=self.group_size)
-            return jnp.linalg.norm(x, axis=-1)
-
+    ) -> tuple[Self, Bool[Array, ""], Bool[Array, ""]]:
         # check primal
-        primal_residual = grouped_norm(self.x - self.z)
-        primal_target = jnp.maximum(grouped_norm(prev.x), grouped_norm(prev.z))
+        primal_residual = jnp.linalg.norm(self.x - self.z)
+        primal_target = jnp.maximum(jnp.linalg.norm(prev.x), jnp.linalg.norm(prev.z))
         primal_ok = primal_residual < EPS + tol * primal_target
 
         # check dual
-        dual_residual = self.rho * grouped_norm(self.z - prev.z)
-        dual_target = self.rho * grouped_norm(prev.u)
+        dual_residual = self.rho * jnp.linalg.norm(self.z - prev.z)
+        dual_target = self.rho * jnp.linalg.norm(prev.u)
         dual_ok = dual_residual < EPS + tol * dual_target
 
         # update rho and u to balance primal and dual residuals
@@ -215,10 +215,7 @@ class GLASSOADMMState(NamedTuple):
             increase = primal_residual > 10 * dual_residual
             decrease = dual_residual > 10 * primal_residual
             scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
-            self = self._replace(
-                rho=self.rho * scale,
-                u=self.u.at[:, :-1].mul(jnp.repeat(1 / scale, self.group_size)),
-            )
+            self = self._replace(rho=self.rho * scale, u=self.u / scale)
         return self, primal_ok, dual_ok
 
 
@@ -303,49 +300,57 @@ class GroupLassoGaussianProcess(NamedTuple):
         autoregressive: bool = True,
         *,
         warmstart: Optional[GLASSOADMMState] = None,
-        theta_range: tuple[float, float] = (0.0, 1.0),
         g_range: tuple[float, float] = (EPS, 1.0),
+        g_init: float = 0.1,
         max_iterations: int = 100,
         tol: Scalar = jnp.array(1e-4),
-        adapt_rho: bool = False,
+        adapt_rho: bool = True,
         n_jobs: int = -1,
-    ) -> tuple[Self, GLASSOADMMState, Scalar, int]:
+    ) -> tuple[Self, GLASSOADMMState, Scalar]:
         _, d_times_g = x_train.shape
         _, o = y_train.shape
         assert d_times_g % group_size == 0
 
-        # get the bounds for the optimization
-        theta_min = jnp.ones((o, d_times_g)) * theta_range[0]
-        theta_max = jnp.ones((o, d_times_g)) * theta_range[1]
-        theta_bounds = jnp.stack([theta_min, theta_max], axis=0)
-        g_min = jnp.ones((o,)) * g_range[0]
-        g_max = jnp.ones((o,)) * g_range[1]
-        g_bounds = jnp.stack([g_min, g_max], axis=0)
-        bounds = jnp.concat([theta_bounds, g_bounds[..., None]], axis=-1)
-
         # initialize ADMM state
-        state = (
-            GLASSOADMMState.initialize(bounds, l1_penalty, group_size)
-            if warmstart is None
-            else warmstart._replace(
-                rho=l1_penalty * jnp.ones_like(warmstart.rho),
+        if warmstart is not None:
+            state = warmstart._replace(
+                rho=jnp.ones_like(warmstart.rho),
                 l1=l1_penalty,
                 u=jnp.zeros_like(warmstart.u),
             )
-        )
+        else:
+            # data-driven (hetgpy) lengthscale bounds; hetgpy's Gaussian kernel is
+            # exp(-d^2 / l), ours is exp(-0.5 * theta^2 * d^2), so theta = sqrt(2 / l).
+            # short lengthscale (lower) -> largest theta; the group lasso can drive
+            # theta to 0, so its lower bound is 0 everywhere.
+            lower, upper = hetgpy_auto_bounds(x_train)
+            theta_max = jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g))
+            theta_min = jnp.zeros((o, d_times_g))
+            theta_bounds = jnp.stack([theta_min, theta_max], axis=0)
+            theta_init = jnp.broadcast_to(
+                jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d_times_g)
+            )
 
-        n_iters = max_iterations
+            # g is optimized within its bounds, initialized at g_init
+            g_min = jnp.ones((o,)) * g_range[0]
+            g_max = jnp.ones((o,)) * g_range[1]
+            g_bounds = jnp.stack([g_min, g_max], axis=0)
+            g_init_vec = jnp.ones((o,)) * g_init
+
+            bounds = jnp.concat([theta_bounds, g_bounds[..., None]], axis=-1)
+            x0 = jnp.concat([theta_init, g_init_vec[..., None]], axis=-1)
+            state = GLASSOADMMState.initialize(bounds, x0, l1_penalty, group_size)
+
         for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
             new_state = state.x_update(x_train, y_train, autoregressive, n_jobs=n_jobs)
             new_state = new_state.z_and_u_update()
             state, primal_ok, dual_ok = new_state.check_residuals(state, tol, adapt_rho)
-            pbar.set_postfix({"rho": (state.rho.min().item(), state.rho.max().item())})
+            pbar.set_postfix({"rho": state.rho.item()})
             if primal_ok.all() and dual_ok.all():
-                n_iters = iter + 1
-                print(f"ADMM converged in {n_iters} iterations.")
+                print(f"ADMM converged in {iter + 1} iterations.")
                 break
         else:
             print("ADMM did not converge within the maximum number of iterations.")
 
         self, llk = cls.unpack_parameters(state.x, x_train, y_train)
-        return self, state, llk, n_iters
+        return self, state, llk
