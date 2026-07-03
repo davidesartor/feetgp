@@ -35,7 +35,7 @@ def hetgpy_auto_bounds(
     max_cor: float = 0.5,
 ) -> tuple[Float[np.ndarray, "d"], Float[np.ndarray, "d"]]:
     # rescale each input dimension to [0, 1] (constant columns are left untouched)
-    x = np.asarray(x) # type: ignore
+    x = np.asarray(x)  # type: ignore
     x_min, x_max = x.min(axis=0), x.max(axis=0)
     x_span = np.where(x_max > x_min, x_max - x_min, 1.0)
     x = (x - x_min) / x_span
@@ -149,32 +149,35 @@ class GLASSOADMMState(NamedTuple):
         n_jobs: int = -1,
     ) -> Self:
         def solve_ith_output(i):
+            group_start = (i // self.group_size) * self.group_size
             x_train_i = np.array(x_train)
+            new_x = np.array(self.x[i])
+
             if autoregressive:
                 # zero out the group corresponding to the i-th output in the training data
-                start = (i // self.group_size) * self.group_size
-                x_train_i[:, start : start + self.group_size] = 0.0
+                x_train_i[:, group_start : group_start + self.group_size] = 0.0
+                new_x[group_start : group_start + self.group_size] = 0.0
 
             new_x = sp.optimize.minimize(
                 fun=admm_x_update_loss,
-                x0=self.x[i],
+                x0=new_x,
                 args=(self.z[i], self.u[i], self.rho, x_train_i, y_train[:, i]),
                 jac=True,
                 method="L-BFGS-B",
                 bounds=list(zip(self.bounds[0, i], self.bounds[1, i])),
                 options=dict(maxiter=maxiter, ftol=EPS, gtol=0.0),
             ).x
+
+            if autoregressive:
+                # zero out the group corresponding to the i-th output in the result
+                new_x[group_start : group_start + self.group_size] = 0.0
             return new_x
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(solve_ith_output)(i) for i in range(len(self.x))
         )
-        new_x = np.stack([np.array(r) for r in results])
-        if autoregressive:
-            for i in range(len(self.x)):
-                start = (i // self.group_size) * self.group_size
-                new_x[i, start : start + self.group_size] = 0.0
-        return self._replace(x=jnp.array(new_x))
+        new_x = jnp.stack([np.array(r) for r in results])
+        return self._replace(x=new_x)
 
     @eqx.filter_jit
     def z_and_u_update(self) -> Self:
@@ -198,7 +201,7 @@ class GLASSOADMMState(NamedTuple):
 
     @eqx.filter_jit
     def check_residuals(
-        self, prev: Self, tol: Scalar, adapt_rho: bool = False
+        self, prev: Self, tol: Scalar, adapt_rho: bool = True
     ) -> tuple[Self, Bool[Array, ""], Bool[Array, ""]]:
         # check primal
         primal_residual = jnp.linalg.norm(self.x - self.z)
@@ -299,52 +302,47 @@ class GroupLassoGaussianProcess(NamedTuple):
         group_size: int,
         autoregressive: bool = True,
         *,
-        warmstart: Optional[GLASSOADMMState] = None,
+        warmstart: Optional[Self] = None,
         g_range: tuple[float, float] = (1e-4, 1.0),
-        g_init: float = 0.1,
-        max_iterations: int = 100,
-        tol: Scalar = jnp.array(1e-4),
+        max_iterations: int = 1000,
+        tol: Scalar = jnp.array(1e-3),
         adapt_rho: bool = True,
+        adapt_rho_iters: int = 50,
         n_jobs: int = -1,
-    ) -> tuple[Self, GLASSOADMMState, Scalar]:
+    ) -> tuple[Self, Scalar]:
         _, d_times_g = x_train.shape
         _, o = y_train.shape
         assert d_times_g % group_size == 0
 
-        # initialize ADMM state
+        # data-driven (hetgpy) lengthscale bounds;
+        lower, upper = hetgpy_auto_bounds(x_train)
+        theta_max = jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g))
+        theta_min = jnp.zeros((o, d_times_g))
+        theta_bounds = jnp.stack([theta_min, theta_max], axis=0)
+        theta_init = jnp.broadcast_to(
+            jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d_times_g)
+        )
+        # bounds for g (noise variance)
+        g_min = jnp.ones((o,)) * g_range[0]
+        g_max = jnp.ones((o,)) * g_range[1]
+        g_bounds = jnp.stack([g_min, g_max], axis=0)
+        bounds = jnp.concat([theta_bounds, g_bounds[..., None]], axis=-1)
+        g_init = jnp.ones((o,)) * (0.9 * g_range[0] + 0.1 * g_range[1])
+
+        # warmstart overrides x0 (and z0) with the previous solution's parameters
         if warmstart is not None:
-            state = warmstart._replace(
-                rho=jnp.ones_like(warmstart.rho),
-                l1=l1_penalty,
-                u=jnp.zeros_like(warmstart.u),
-            )
-        else:
-            # data-driven (hetgpy) lengthscale bounds; hetgpy's Gaussian kernel is
-            # exp(-d^2 / l), ours is exp(-0.5 * theta^2 * d^2), so theta = sqrt(2 / l).
-            # short lengthscale (lower) -> largest theta; the group lasso can drive
-            # theta to 0, so its lower bound is 0 everywhere.
-            lower, upper = hetgpy_auto_bounds(x_train)
-            theta_max = jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g))
-            theta_min = jnp.zeros((o, d_times_g))
-            theta_bounds = jnp.stack([theta_min, theta_max], axis=0)
-            theta_init = jnp.broadcast_to(
-                jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d_times_g)
-            )
+            theta_init = warmstart.theta
+            g_init = warmstart.g
 
-            # g is optimized within its bounds, initialized at g_init
-            g_min = jnp.ones((o,)) * g_range[0]
-            g_max = jnp.ones((o,)) * g_range[1]
-            g_bounds = jnp.stack([g_min, g_max], axis=0)
-            g_init_vec = jnp.ones((o,)) * g_init
-
-            bounds = jnp.concat([theta_bounds, g_bounds[..., None]], axis=-1)
-            x0 = jnp.concat([theta_init, g_init_vec[..., None]], axis=-1)
-            state = GLASSOADMMState.initialize(bounds, x0, l1_penalty, group_size)
+        x0 = jnp.concat([theta_init, g_init[..., None]], axis=-1)
+        state = GLASSOADMMState.initialize(bounds, x0, l1_penalty, group_size)
 
         for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
             new_state = state.x_update(x_train, y_train, autoregressive, n_jobs=n_jobs)
             new_state = new_state.z_and_u_update()
-            state, primal_ok, dual_ok = new_state.check_residuals(state, tol, adapt_rho)
+            state, primal_ok, dual_ok = new_state.check_residuals(
+                state, tol, adapt_rho and iter < max_iterations // 2
+            )
             pbar.set_postfix({"rho": state.rho.item()})
             if primal_ok.all() and dual_ok.all():
                 print(f"ADMM converged in {iter + 1} iterations.")
@@ -353,4 +351,4 @@ class GroupLassoGaussianProcess(NamedTuple):
             print("ADMM did not converge within the maximum number of iterations.")
 
         self, llk = cls.unpack_parameters(state.x, x_train, y_train)
-        return self, state, llk
+        return self, llk

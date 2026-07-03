@@ -42,7 +42,7 @@ class GLASSOADMMState(NamedTuple):
 
     @eqx.filter_jit
     def check_residuals(
-        self, prev: Self, tol: Scalar, adapt_rho: bool = False
+        self, prev: Self, tol: Scalar, adapt_rho: bool = True
     ) -> tuple[Self, Bool[Array, ""], Bool[Array, ""]]:
         # check primal
         primal_residual = jnp.linalg.norm(self.x - self.z)
@@ -64,13 +64,13 @@ class GLASSOADMMState(NamedTuple):
 
 
 class GroupLassoLinear(NamedTuple):
-    A: Float[Array, "o d*g"]
+    theta: Float[Array, "o d*g"]
     x_train: Float[Array, "n d*g"]
     y_train: Float[Array, "n o"]
 
     @jax.jit
     def predict(self, xs: Float[Array, "m d*g"]) -> Float[Array, "o m"]:
-        return self.A @ xs.T
+        return self.theta @ xs.T
 
     @classmethod
     def fit(
@@ -79,18 +79,22 @@ class GroupLassoLinear(NamedTuple):
         y_train: Float[Array, "n o"],
         l1_penalty: Scalar,
         group_size: int,
+        *,
         max_iterations: int = 1000,
-        tol: Scalar = jnp.array(1e-4),
+        tol: Scalar = jnp.array(1e-3),
         adapt_rho: bool = True,
-    ) -> Self:
+        **kwargs,  # ignored, used for api compatibility
+    ) -> tuple[Self, Scalar]:
         n, d_times_g = x_train.shape
         n, o = y_train.shape
         assert d_times_g % group_size == 0
 
+        x0 = jnp.zeros((o, d_times_g))
+
         # initialize ADMM state
         state = GLASSOADMMState(
-            x=jnp.zeros((o, d_times_g)),
-            z=jnp.zeros((o, d_times_g)),
+            x=x0,
+            z=x0,
             u=jnp.zeros((o, d_times_g)),
             rho=jnp.array(1.0),
             l1=l1_penalty,
@@ -101,11 +105,16 @@ class GroupLassoLinear(NamedTuple):
         for iter in (pbar := tqdm(range(max_iterations), desc="ADMM")):
             new_state = state.x_update(x_train, y_train)
             new_state = new_state.z_and_u_update()
-            state, primal_ok, dual_ok = new_state.check_residuals(state, tol, adapt_rho)
+            state, primal_ok, dual_ok = new_state.check_residuals(
+                state, tol, adapt_rho and iter < max_iterations // 2
+            )
             pbar.set_postfix({"rho": state.rho.item()})
             if primal_ok.all() and dual_ok.all():
                 print(f"ADMM converged in {iter+1} iterations.")
                 break
         else:
             print("ADMM did not converge within the maximum number of iterations.")
-        return cls(A=state.x, x_train=x_train, y_train=y_train)
+
+        model = cls(theta=state.z, x_train=x_train, y_train=y_train)
+        loss = 0.5 * jnp.sum((y_train.T - model.predict(x_train)) ** 2)
+        return model, loss

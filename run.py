@@ -1,5 +1,6 @@
 from jaxtyping import Float, Scalar
 from numpy.typing import NDArray
+from jaxtyping import Array
 
 import os
 import pickle
@@ -10,7 +11,7 @@ import jax.numpy as jnp
 from einops import rearrange
 from sklearn.metrics import r2_score
 
-from glassogp import GroupLassoGaussianProcess
+from glassogp import GroupLassoGaussianProcess, kernel, loglikelihood
 from linear import GroupLassoLinear
 from inclinerunning import InclineRunning
 
@@ -41,7 +42,9 @@ if __name__ == "__main__":
     parser.add_argument("--linear_model", action="store_true", default=False)
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
     # pass --relative alone for the LMAL/MMAL midpoint, or --relative MARKER for a specific marker
-    parser.add_argument("--relative", type=str, nargs="?", default=None, const="midpoint")
+    parser.add_argument(
+        "--relative", type=str, nargs="?", default=None, const="midpoint"
+    )
 
     # OPTIMIZATION ARGS
     parser.add_argument("--maxiter", type=int, default=500)
@@ -91,131 +94,114 @@ if __name__ == "__main__":
     _, o = y_train.shape
 
     def fit(l1_penalty: float, warmstart=None):
-        if args.linear_model:
-            model = GroupLassoLinear.fit(
-                x_train=x_train,
-                y_train=y_train,
-                l1_penalty=jnp.array(l1_penalty),
-                group_size=group_size,
-                max_iterations=args.maxiter,
-                tol=jnp.array(args.tol),
-            )
-            return model, None, None
-        else:
-            model, state, llk = GroupLassoGaussianProcess.fit(
-                x_train=x_train,
-                y_train=y_train,
-                l1_penalty=jnp.array(l1_penalty),
-                group_size=group_size,
-                autoregressive=autoregressive,
-                warmstart=warmstart,
-                max_iterations=args.maxiter,
-                tol=jnp.array(args.tol),
-                n_jobs=args.n_jobs,
-            )
-            return model, state, llk
+        model_cls = GroupLassoLinear if args.linear_model else GroupLassoGaussianProcess
+        return model_cls.fit(
+            x_train=x_train,
+            y_train=y_train,
+            l1_penalty=jnp.array(l1_penalty),
+            group_size=group_size,
+            autoregressive=autoregressive,  # type: ignore only used for GP model
+            warmstart=warmstart,  # type: ignore only used for GP model
+            max_iterations=args.maxiter,
+            tol=jnp.array(args.tol),
+            n_jobs=args.n_jobs,  # type: ignore only used for GP model
+        )
 
     def group_norms(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
     ) -> Float[NDArray, "d"]:
-        params = (
-            model.theta if isinstance(model, GroupLassoGaussianProcess) else model.A
-        )
-        groups = rearrange(params, "o (d g) -> d (o g)", g=group_size)
+        groups = rearrange(model.theta, "o (d g) -> d (o g)", g=group_size)
         norms = np.linalg.norm(np.asarray(groups), axis=-1)
         return norms
 
     def r2_scores(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
-        x: Float[NDArray, "m d"],
-        y: Float[NDArray, "m o"],
-    ) -> Float[NDArray, "o"]:
+        x: Float[Array, "m d"],
+        y: Float[Array, "m o"],
+    ) -> Float[Array, "o"]:
         y_pred = np.array(model.predict(x))
-        r2 = np.array([r2_score(y[:, j], y_pred[j, :]) for j in range(o)])
+        r2 = jnp.array([r2_score(y[:, j], y_pred[j, :]) for j in range(o)])
         return r2
-
-    def lambda_path(l1_penalty: float) -> str:
-        # zero-padded fixed-point filename so lexical order matches numeric order
-        return os.path.join(save_dir, f"lambda={float(l1_penalty):013.6f}.pkl")
 
     def record(
         l1_penalty: float,
         model: GroupLassoGaussianProcess | GroupLassoLinear,
-        state,
-        llk: Scalar | None,
+        llk: Scalar,
     ) -> dict:
         gn = group_norms(model)
-        r2 = r2_scores(model, x_test, y_test)
+        r2_test = r2_scores(model, x_test, y_test)
         r2_train = r2_scores(model, x_train, y_train)
         n_active = int(np.sum(gn > 1e-8))
         print(f"lambda = {l1_penalty:.4g}")
         print(f"    active groups = {n_active}/{len(gn)}")
         print(f"    max gnorm = {gn.max():.4f}")
-        print(f"    r2 (test)  = [{r2.min():.3f}, {r2.max():.3f}]")
+        print(f"    r2 (test)  = [{r2_test.min():.3f}, {r2_test.max():.3f}]")
         print(f"    r2 (train) = [{r2_train.min():.3f}, {r2_train.max():.3f}]")
 
+        # remove the training data from the model before saving, to reduce pickle size
         results = dict(
-            l1_penalty=float(l1_penalty),
-            model=(
-                model
-                if isinstance(model, GroupLassoLinear)
-                else model._replace(x_train=None, y_train=None)
-            ),
-            # ADMM warmstart state (None for the linear model); persisted so a
-            # killed run can resume the lambda sweep with a warm start.
-            admm_state=state,
+            l1_penalty=l1_penalty,
+            model=model._replace(x_train=None, y_train=None),
             group_norms=gn,
-            r2=r2,
+            r2_test=r2_test,
             r2_train=r2_train,
-            llk=float(llk) if llk is not None else None,
+            llk=llk,
             n_active=n_active,
         )
-        # atomic write: a crash mid-dump can't leave a truncated pickle behind
-        path = lambda_path(l1_penalty)
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
+        path = os.path.join(save_dir, f"lambda={float(l1_penalty):013.6f}.pkl")
+        with open(path, "wb") as f:
             pickle.dump(results, f)
-        os.replace(tmp, path)
         return results
 
     def fit_or_load(l1_penalty: float, warmstart=None) -> tuple[dict, object]:
         """Fit at l1_penalty, or reuse a previously saved result to resume a run.
 
-        Returns the results dict and the ADMM state to warmstart the next fit.
+        Returns the results dict and the previous solution's model instance,
+        used to warmstart the next fit.
         """
-        path = lambda_path(l1_penalty)
+        path = os.path.join(save_dir, f"lambda={float(l1_penalty):013.6f}.pkl")
         if not args.overwrite and os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    results = pickle.load(f)
-                n_active = results["n_active"]
-                n_groups = len(results["group_norms"])
-                print(f"lambda = {l1_penalty:.4g} (cached, resuming)")
-                print(f"    active groups = {n_active}/{n_groups}")
-                return results, results.get("admm_state")
-            except Exception as e:
-                # a run killed mid-write can leave a truncated pickle; refit it
-                print(f"lambda = {l1_penalty:.4g}: corrupt cache ({e}), refitting")
-        model, state, llk = fit(l1_penalty, warmstart=warmstart)
-        results = record(l1_penalty, model, state, llk)
-        return results, state
+            with open(path, "rb") as f:
+                results = pickle.load(f)
+            n_active = results["n_active"]
+            n_groups = len(results["group_norms"])
+            print(f"lambda = {l1_penalty:.4g} (cached, resuming)")
+            print(f"    active groups = {n_active}/{n_groups}")
+            return results, results["model"]
+        model, llk = fit(l1_penalty, warmstart=warmstart)
+        results = record(l1_penalty, model, llk)
+        return results, model
 
     ############################################################
     # Probe lambda_max: unpenalized fit gives upper bound on group norms
     ############################################################
-    results, unpenalized_admm = fit_or_load(0.0, warmstart=None)
+    results, unpenalized_warmstart = fit_or_load(0.0, warmstart=None)
     gn = results["group_norms"]
 
     ############################################################
-    # Pivot: lambda where penalty term balances the negative log-likelihood
+    # Pivot: lambda where penalty term balances the log-likelihood gained
+    # by fitting over the null (theta=0, i.e. linear: A=0) model
     ############################################################
-    lambda_pivot = 1 / gn.sum()
-    results, pivot_admm_state = fit_or_load(lambda_pivot, warmstart=unpenalized_admm)
+    fitted_model = results["model"]
+    if args.linear_model:
+        null_loss = 0.5 * jnp.sum(y_train**2)
+        delta = results["llk"] - null_loss
+    else:
+        # same nugget (g) per output as the fitted model, or the null-model
+        # kernel (all ones, since theta=0) is singular and cho_factor -> nan
+        K0 = kernel(jnp.zeros(d), x_train, x_train)
+        null_ll = lambda g, y: loglikelihood(K0 + g * jnp.eye(n), y)[0]
+        llks = jax.vmap(null_ll)(fitted_model.g, y_train.T)
+        delta = results["llk"] - jnp.sum(llks)
+    lambda_pivot = 0.1 * abs(delta) / gn.sum()
+    results, pivot_warmstart = fit_or_load(
+        lambda_pivot, warmstart=unpenalized_warmstart
+    )
 
     ############################################################
     # Search lambda_max: double from pivot until all groups die
     ############################################################
-    warmstart = pivot_admm_state
+    warmstart = pivot_warmstart
     lambda_max = lambda_pivot
     for _ in range(args.lambda_budget // 2):
         lambda_max *= args.lambda_step
@@ -228,7 +214,7 @@ if __name__ == "__main__":
     ############################################################
     # Search lambda_min: halve from pivot until full support
     ############################################################
-    warmstart = pivot_admm_state
+    warmstart = pivot_warmstart
     lambda_min = lambda_pivot
     for _ in range(args.lambda_budget // 2):
         lambda_min /= args.lambda_step
