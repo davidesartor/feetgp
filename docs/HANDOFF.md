@@ -9,10 +9,12 @@
 > predate the 2026-08-04 restructure: library **and** entry points are in `src/feetgp/` and run as
 > `python -m feetgp.run`, benches in `bench/` (run with `-m`), batch scripts in `slurm/`. Every
 > result directory this file refers to, `results_v7` included, has been deleted; `RESULTS.md` and
-> `results_summary.jsonl` are all that is left of them.
+> `results_summary.jsonl` are all that is left of them. **"The planned integration" is done**: the
+> `lbfgsb` worktree was poured into `main` on 2026-08-04 as a `--solver {optimistix,lbfgsb}`
+> switch and the branch deleted — see `CLAUDE.md`, "the bounded L-BFGS lives in `vlse` now".
 
 Paste this whole file into a new chat to resume. Repo `/home/dsartor_umass_edu/feetgp`, branch
-`main`, worktree `/home/dsartor_umass_edu/feetgp-lbfgsb` on branch `lbfgsb`. Read `CLAUDE.md` and
+`main`. Read `CLAUDE.md` and
 `ROADMAP.md` first — they carry the invariants; this file only carries state and the open threads.
 
 ## The standing goal (user's words)

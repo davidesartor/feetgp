@@ -73,11 +73,24 @@ if __name__ == "__main__":
     parser.add_argument("--tol", type=float, default=1e-3)
     # outputs solved per batched x-update; bigger keeps the device busier, at n*n each
     parser.add_argument("--chunk_size", type=int, default=8)
+    # "optimistix" is unconstrained L-BFGS plus a projection onto the box, "lbfgsb" is
+    # vlse's bounded solver. Measured at one knot from a single warmstart, lbfgsb took
+    # 67.4s and 16 ADMM iterations against optimistix's 488.7s and 35, at equal-or-better
+    # loglik -- but vlse 0.1.0 is not released, so optimistix stays the default
+    parser.add_argument(
+        "--solver", choices=("optimistix", "lbfgsb"), default="optimistix"
+    )
     # inner L-BFGS budget per ADMM iteration. A cheap inexact x-update run many times
-    # beats an exact one run a few times: the cost is iterations * outputs * inner_steps
-    parser.add_argument("--inner_maxiter", type=int, default=50)
-    # step tolerance, not gradient: 1e-4 matches 1.49e-8 to 4e-6 relative in half the steps
-    parser.add_argument("--inner_tol", type=float, default=1e-4)
+    # beats an exact one run a few times: the cost is iterations * outputs * inner_steps.
+    # counts whole line searches under lbfgsb and single steps under optimistix, hence
+    # the two defaults, resolved below
+    parser.add_argument("--inner_maxiter", type=int, default=None)
+    # optimistix: step tolerance, not gradient -- 1e-4 matches 1.49e-8 to 4e-6 relative in
+    # half the steps. lbfgsb: projected-gradient tolerance, scipy's pgtol
+    parser.add_argument("--inner_tol", type=float, default=None)
+    # lbfgsb only, the straggler's leash: at inner_maxiter=12, cutting 30 -> 5 took one
+    # x-update from 28.24s to 9.45s for the same objective to eight digits
+    parser.add_argument("--inner_max_linesearch", type=int, default=5)
     parser.add_argument("--history_length", type=int, default=40)
     # iteration after which rho is frozen so the problem stops moving; defaults to
     # max_iterations // 2, which is what it was implicitly tied to
@@ -93,6 +106,13 @@ if __name__ == "__main__":
     # by default an existing lambda pickle is reused (resume); --overwrite refits
     parser.add_argument("--overwrite", action="store_true", default=False)
     args = parser.parse_args()
+
+    # the two inner solvers stop on different criteria and count different things, so an
+    # unset budget or tolerance means whatever is right for the solver in use
+    if args.inner_maxiter is None:
+        args.inner_maxiter = 5 if args.solver == "lbfgsb" else 50
+    if args.inner_tol is None:
+        args.inner_tol = 1e-2 if args.solver == "lbfgsb" else 1e-4
 
     group_size = 6 if (args.feet == "both" and not args.ungroup_feet) else 3
     autoregressive = args.target == "markers"
@@ -217,9 +237,12 @@ if __name__ == "__main__":
             tol=jnp.array(args.tol),
             adapt_rho_iters=args.adapt_rho_iters,
             chunk_size=chunk_size,  # type: ignore only used for GP model
+            solver=args.solver,  # type: ignore only used for GP model
             inner_maxiter=args.inner_maxiter,  # type: ignore only used for GP model
             inner_rtol=args.inner_tol,  # type: ignore only used for GP model
             inner_atol=args.inner_tol,  # type: ignore only used for GP model
+            inner_pgtol=args.inner_tol,  # type: ignore only used for GP model
+            inner_max_linesearch=args.inner_max_linesearch,  # type: ignore GP only
             history_length=args.history_length,  # type: ignore only used for GP model
             log_every=args.log_every,
         )

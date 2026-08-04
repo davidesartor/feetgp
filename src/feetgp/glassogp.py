@@ -14,6 +14,13 @@ from scipy.spatial.distance import cdist
 from feetgp import admm
 from feetgp.admm import ADMMState
 
+# jaxvlse 0.1.0 is not released yet, so the bounded x-update is opt-in and the
+# optimistix one stays the default
+try:
+    from vlse.lbfgsb import minimise as lbfgsb_minimise
+except ImportError:
+    lbfgsb_minimise = None
+
 jax.config.update("jax_enable_x64", True)
 
 
@@ -256,6 +263,79 @@ def x_update_solve(
     )
 
 
+@eqx.filter_jit
+def x_update_solve_bounded(
+    x0: Float[Array, "o d*g+1"],
+    target_theta: Float[Array, "o d*g"],
+    rho: Scalar,
+    masked_designs: Float[Array, "n_groups n d*g"],
+    y_train: Float[Array, "n o"],
+    group_size: int,
+    bounds: tuple[Float[Array, "o d*g+1"], Float[Array, "o d*g+1"]],
+    mask: Optional[Float[Array, "o d*g+1"]] = None,
+    g_min: Scalar = jnp.array(1e-4),
+    g_max: Scalar = jnp.array(1.0),
+    maxiter: int = 5,
+    chunk_size: int = 8,
+    history_length: int = 40,
+    tol: float = 1e-2,
+    max_linesearch: int = 5,
+) -> Float[Array, "o d*g+1"]:
+    """The same subproblems as x_update_solve, under a real box instead of a projection.
+
+    theta >= 0 is the solver's own feasible set here, so a dead group -- whose target
+    z - u is negative -- returns exactly zero rather than the unconstrained minimiser the
+    caller then has to clip, and the mirror well the even objective puts at -theta is
+    outside the feasible set entirely.
+
+    Neither budget converts one-for-one from the optimistix path. tol is the infinity norm
+    of the *projected gradient* (scipy's pgtol), not a step criterion, so the same
+    magnitude is far tighter; maxiter counts whole line searches rather than evaluations,
+    which is why its default is 5 and not 50. max_linesearch is the straggler's leash and
+    is close to free: a lax.map chunk costs the max over its members, so capping the line
+    search bounds the worst output rather than the mean -- measured at inner_maxiter=12,
+    cutting 30 to 5 took one x-update from 28.24s to 9.45s for the same objective to eight
+    digits and the same projected gradient.
+    """
+    if lbfgsb_minimise is None:
+        raise ImportError(
+            "the bounded x-update needs vlse.lbfgsb: `uv add jaxvlse` once 0.1.0 ships"
+        )
+    x0 = x0 if mask is None else x0 * mask
+    lower, upper = bounds
+    group_of_output = jnp.arange(len(x0)) // group_size
+
+    def solve_one_output(args) -> Float[Array, "d*g+1"]:
+        x0_i, target_i, y_i, group_i, mask_i, lower_i, upper_i = args
+        # vlse calls f(x, *args), optimistix calls f(x, args) -- one extra level of
+        # nesting is what lets both drive the same loss
+        solution = lbfgsb_minimise(
+            admm_x_update_loss,
+            x0_i,
+            (lower_i, upper_i),
+            args=((target_i, rho, masked_designs[group_i], y_i, g_min, g_max),),
+            tol=tol,
+            max_iterations=maxiter,
+            history_length=history_length,
+            max_linesearch=max_linesearch,
+        )
+        return solution.x * mask_i
+
+    return jax.lax.map(
+        solve_one_output,
+        (
+            x0,
+            target_theta,
+            y_train.T,
+            group_of_output,
+            jnp.ones_like(x0) if mask is None else mask,
+            lower,
+            upper,
+        ),
+        batch_size=chunk_size,
+    )
+
+
 class GroupLassoGaussianProcess(NamedTuple):
     theta: Float[Array, "o d*g"]
     g: Float[Array, "o"]
@@ -350,10 +430,22 @@ class GroupLassoGaussianProcess(NamedTuple):
         # plain ADMM, deliberately: Boyd's 1.5-1.8 band is wrong for this problem. See
         # admm.z_and_u_update for why over-relaxation and the theta box are incompatible.
         alpha: float = 1.0,
+        # "optimistix" is unconstrained L-BFGS plus a projection, "lbfgsb" is vlse's
+        # bounded solver. Measured at one knot from a single warmstart, lbfgsb at
+        # inner_maxiter=5 max_linesearch=5 took 67.4s and 16 ADMM iterations against
+        # optimistix's 488.7s and 35, at equal-or-better loglik
+        solver: str = "optimistix",
         inner_maxiter: int = 50,
-        inner_maxiter_init: int = 20,
+        # first rung of the ramp. lbfgsb's budget counts whole line searches, so it runs
+        # an order of magnitude smaller than optimistix's step count and a shared start of
+        # 20 would sit above the cap from iteration 0 -- leaving the ramp inert and, worse,
+        # reporting every x-update as exact so the convergence break could fire immediately
+        inner_maxiter_init: Optional[int] = None,
         inner_rtol: float = 1e-4,
         inner_atol: float = 1e-4,
+        # lbfgsb only: projected-gradient tolerance and the line-search cap
+        inner_pgtol: float = 1e-2,
+        inner_max_linesearch: int = 5,
         chunk_size: int = 8,
         history_length: int = 40,
         # tqdm goes to stderr and only shows the latest iteration; a periodic stdout row
@@ -363,6 +455,9 @@ class GroupLassoGaussianProcess(NamedTuple):
         _, d_times_g = x_train.shape
         _, o = y_train.shape
         assert d_times_g % group_size == 0
+        assert solver in ("optimistix", "lbfgsb"), solver
+        if inner_maxiter_init is None:
+            inner_maxiter_init = 1 if solver == "lbfgsb" else 20
 
         # data-driven (hetgpy) lengthscale bounds; they only depend on x_train, so a
         # lambda sweep computes them once and passes them in
@@ -374,6 +469,13 @@ class GroupLassoGaussianProcess(NamedTuple):
             jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g)), group_size
         )
         bounds = jnp.stack([jnp.zeros_like(theta_max), theta_max], axis=0)
+        # the same box in the layout the inner solver wants, one row per output, with the
+        # nugget column left unbounded because w saturates rather than being clipped
+        unbounded = jnp.full((o, 1), jnp.inf)
+        solver_bounds = (
+            jnp.concat([admm.to_outputs(bounds[0], group_size), -unbounded], axis=-1),
+            jnp.concat([admm.to_outputs(bounds[1], group_size), unbounded], axis=-1),
+        )
         theta_init = admm.to_groups(
             jnp.broadcast_to(
                 jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d_times_g)
@@ -417,22 +519,43 @@ class GroupLassoGaussianProcess(NamedTuple):
             # reporting exactness only at the cap stops a cheap iteration faking convergence
             maxiter = min(inner_maxiter, inner_maxiter_init * 2**iteration)
             theta = admm.to_outputs(state.x, group_size)
-            solution = x_update_solve(
-                jnp.concat([theta, state.aux[..., None]], axis=-1),
-                admm.to_outputs(state.z - state.u, group_size),
-                state.rho,
-                masked_designs,
-                y_train,
-                group_size,
-                mask=mask,
-                g_min=g_min,
-                g_max=g_max,
-                maxiter=maxiter,
-                chunk_size=chunk_size,
-                history_length=history_length,
-                rtol=inner_rtol,
-                atol=inner_atol,
-            )
+            x0 = jnp.concat([theta, state.aux[..., None]], axis=-1)
+            target = admm.to_outputs(state.z - state.u, group_size)
+            if solver == "lbfgsb":
+                solution = x_update_solve_bounded(
+                    x0,
+                    target,
+                    state.rho,
+                    masked_designs,
+                    y_train,
+                    group_size,
+                    solver_bounds,
+                    mask=mask,
+                    g_min=g_min,
+                    g_max=g_max,
+                    maxiter=maxiter,
+                    chunk_size=chunk_size,
+                    history_length=history_length,
+                    tol=inner_pgtol,
+                    max_linesearch=inner_max_linesearch,
+                )
+            else:
+                solution = x_update_solve(
+                    x0,
+                    target,
+                    state.rho,
+                    masked_designs,
+                    y_train,
+                    group_size,
+                    mask=mask,
+                    g_min=g_min,
+                    g_max=g_max,
+                    maxiter=maxiter,
+                    chunk_size=chunk_size,
+                    history_length=history_length,
+                    rtol=inner_rtol,
+                    atol=inner_atol,
+                )
             # project onto the same box z lives in, so a group the prox is killing reaches
             # exactly zero rather than the unconstrained minimiser near -u
             theta = admm.to_groups(solution[:, :-1], group_size)
