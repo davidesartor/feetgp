@@ -8,9 +8,16 @@
 *.txt
 *.out
 *.err
-# Ignore slurm files 
+# Ignore slurm files, except the ones kept as a record of what each run was submitted with
 *.slurm
+!slurm/*.slurm
 *.html
+
+# run outputs and the raw dataset
+results/
+results_*/
+data/
+logs/
 
 # ignore .vscode settings folder
 .vscode/

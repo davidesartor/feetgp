@@ -60,6 +60,7 @@ class InclineRunning:
         # load marker data for the input features
         df_markers = self.load_marker_data(inclines, relative)
         x = df_markers.values
+        self.x_columns = list(df_markers.columns)
         print("Loaded marker data with shape:", x.shape, x.dtype)
 
         # load data for the target variable
@@ -68,16 +69,15 @@ class InclineRunning:
             y = np.cbrt(
                 df_forces.values
             )  # cube root to make the distribution more normal
+            self.y_columns = list(df_forces.columns)
         elif target == "markers":
             y = x.copy()
+            self.y_columns = list(self.x_columns)
         print("Loaded target data with shape:", y.shape, y.dtype)
 
-        # subsample the data and drop rows with NaN values or all-zero markers
+        # subsample the data and drop rows with NaN values
         x, y = x[::subsample], y[::subsample]
-        valid = (
-            ~np.isnan(x).any(axis=1)
-            & ~np.isnan(y).any(axis=1)
-        )
+        valid = ~np.isnan(x).any(axis=1) & ~np.isnan(y).any(axis=1)
         x, y = x[valid], y[valid]
 
         # train-test split
@@ -129,14 +129,22 @@ class InclineRunning:
                         continue
                     if relative == "midpoint":
                         # reference is the midpoint between the LMAL and MMAL markers
-                        ref = (df[f"{prefix}LMAL {coord}"] + df[f"{prefix}MMAL {coord}"]) / 2
+                        ref = (
+                            df[f"{prefix}LMAL {coord}"] + df[f"{prefix}MMAL {coord}"]
+                        ) / 2
                     else:
                         ref = df[f"{prefix}{relative} {coord}"]
                     df[cols] = df[cols].subtract(ref, axis=0)
             if relative != "midpoint":
                 # drop the reference marker (now identically zero); the midpoint
                 # is not a marker column, so nothing is dropped in that mode
-                df = df.drop(columns=[c for c in df.columns if any(c.startswith(f"{p}{relative} ") for p in ("L", "R"))])
+                df = df.drop(
+                    columns=[
+                        c
+                        for c in df.columns
+                        if any(c.startswith(f"{p}{relative} ") for p in ("L", "R"))
+                    ]
+                )
         return df
 
     def load_ground_reaction_forces(

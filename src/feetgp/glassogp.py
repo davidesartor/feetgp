@@ -1,0 +1,462 @@
+from typing import NamedTuple, Optional, Self
+from jaxtyping import Array, Float, Scalar
+
+import jax
+import jax.numpy as jnp
+import jax.scipy as jsp
+import equinox as eqx
+import optimistix as optx
+
+from einops import rearrange
+import numpy as np
+from scipy.spatial.distance import cdist
+
+from feetgp import admm
+from feetgp.admm import ADMMState
+
+jax.config.update("jax_enable_x64", True)
+
+
+@jax.jit
+def kernel(
+    theta: Float[Array, "d"],
+    xs1: Float[Array, "n d"],
+    xs2: Float[Array, "m d"],
+) -> Float[Array, "n m"]:
+    """Squared-exponential kernel, expanded as |z1|^2 + |z2|^2 - 2 z1.z2.
+
+    The expansion makes the pairwise work one matmul instead of an n*m*d broadcast,
+    which also keeps the gradient off that tensor.
+    """
+    scaled1, scaled2 = xs1 * theta, xs2 * theta
+    sqnorm1 = jnp.sum(scaled1**2, axis=-1)
+    sqnorm2 = jnp.sum(scaled2**2, axis=-1)
+    sqdist = sqnorm1[:, None] + sqnorm2[None, :] - 2.0 * scaled1 @ scaled2.T
+    return jnp.exp(-0.5 * jnp.maximum(sqdist, 0.0))
+
+
+def hetgpy_auto_bounds(
+    x: Float[Array, "n d"],
+    min_cor: float = 0.01,
+    max_cor: float = 0.5,
+) -> tuple[Float[np.ndarray, "d"], Float[np.ndarray, "d"]]:
+    # rescale each input dimension to [0, 1] (constant columns are left untouched)
+    x = np.asarray(x)  # type: ignore
+    x_min, x_max = x.min(axis=0), x.max(axis=0)
+    x_span = np.where(x_max > x_min, x_max - x_min, 1.0)
+    x = (x - x_min) / x_span
+
+    # pairwise squared distances, keeping only the strictly-lower nonzero pairs
+    dists = cdist(x, x, metric="sqeuclidean")
+    dists = dists[np.tril(dists, k=-1) > 0]
+
+    # hetgpy heuristic: pick lengthscales so the given distance quantiles map to
+    # the target correlations min_cor (short) and max_cor (long)
+    lower = -np.quantile(dists, 0.05) / np.log(min_cor) * x_span**2
+    upper = -np.quantile(dists, 0.95) / np.log(max_cor) * x_span**2
+    return lower, upper
+
+
+@eqx.filter_jit
+def gp_posterior(
+    Kox: Float[Array, "n m"],
+    Koo: Float[Array, "n n"],
+    observed_ys: Float[Array, "n"],
+    b: Scalar,
+    Kxx: Optional[Float[Array, "m m"]] = None,
+) -> Float[Array, "m"] | tuple[Float[Array, "m"], Float[Array, "m m"]]:
+    """Posterior mean, plus covariance if Kxx is given. Kxx=None skips the m*m work."""
+    chol = jsp.linalg.cho_factor(Koo)
+    gain = jsp.linalg.cho_solve(chol, Kox)
+    mean = b + gain.T @ (observed_ys - b)
+    if Kxx is None:
+        return mean
+
+    cov = Kxx - Kox.T @ gain
+
+    # Add correction based on the trend estimation correlation
+    Kbx = jnp.ones((1, len(observed_ys))) @ gain
+    Ki_1 = jsp.linalg.cho_solve(chol, jnp.ones_like(observed_ys))
+    cov = cov + (1 - Kbx).T @ (1 - Kbx) / Ki_1.sum()
+    return mean, cov
+
+
+@jax.jit
+def loglikelihood(
+    Koo: Float[Array, "n n"],
+    observed_ys: Float[Array, "n"],
+) -> tuple[Scalar, Scalar, Scalar]:
+    # cholesky of K and compute logdet
+    K_sqrt, is_lower = jsp.linalg.cho_factor(Koo)
+    logdetK = 2.0 * jnp.sum(jnp.log(jnp.diag(K_sqrt)))
+
+    # compute Ki_1=(K^-1 @ 1) and Ki_y=(K^-1 @ y)
+    Ki_1, Ki_y = jsp.linalg.cho_solve(
+        c_and_lower=(K_sqrt, is_lower),
+        b=jnp.stack([jnp.ones_like(observed_ys), observed_ys], 1),
+    ).T
+
+    # compute optimal trend b and scale nu
+    b = (Ki_1 * observed_ys).sum() / Ki_1.sum()
+    nu = jnp.dot((observed_ys - b) / len(observed_ys), (Ki_y - Ki_1 * b))
+
+    # likelihood when marginalizing over trend and variance
+    loglik = -0.5 * (len(observed_ys) * jnp.log(nu) + logdetK)
+    return (loglik, b, nu)
+
+
+def admm_x_update_loss(
+    x: Float[Array, "d*g+1"],
+    args: tuple,
+) -> Scalar:
+    """x-update objective for one output. x is [theta, w], unconstrained on R.
+
+    The kernel sees relu(theta), not theta, which is what makes the negative orthant
+    flat in the likelihood and kills the mirror well: without it the objective is
+    exactly even, so a target z - u below zero -- which is exactly what a group being
+    killed looks like -- makes the reflected well the deeper one and L-BFGS falls into
+    it. The relu costs no smoothness, because evenness also forces dloglik/dtheta_d = 0
+    at theta_d = 0, so loglik(relu(theta)) is C1 across the boundary.
+
+    The augmented term keeps the *raw* theta so that a coordinate started on the wrong
+    side of zero is still pulled back to its target; if it saw relu(theta) too, the whole
+    negative orthant would be flat and such a coordinate could never escape.
+
+    w carries no augmented term at all: the nugget is an ADMM aux variable, not part of
+    the consensus, so it is fit by the likelihood alone.
+    """
+    target_theta, rho, x_train, y_train, g_min, g_max = args
+    theta, w = x[:-1], x[-1]
+    Koo = kernel(jax.nn.relu(theta), x_train, x_train)
+    Koo = Koo + nugget_from_w(w, g_min, g_max) * jnp.eye(len(y_train))
+    loglik, _, _ = loglikelihood(Koo, y_train)
+    lagrangian = 0.5 * rho * jnp.sum((theta - target_theta) ** 2)
+    return -loglik + lagrangian
+
+
+def nugget_from_w(w: Scalar, g_min: Scalar, g_max: Scalar) -> Scalar:
+    """g in (g_min, g_max) by construction, so the x-update needs no box on w."""
+    return g_min + (g_max - g_min) * jax.nn.sigmoid(w)
+
+
+def w_from_nugget(g: Scalar, g_min: Scalar, g_max: Scalar) -> Scalar:
+    fraction = jnp.clip((g - g_min) / (g_max - g_min), 1e-12, 1 - 1e-12)
+    return jsp.special.logit(fraction)
+
+
+def autoregressive_mask(
+    o: int, d_times_g: int, group_size: int
+) -> Float[Array, "o d*g+1"]:
+    """0 over each output's own marker group, 1 elsewhere (log g always kept)."""
+    output = jnp.arange(o)[:, None] // group_size
+    column = jnp.arange(d_times_g)[None, :] // group_size
+    return jnp.concatenate(
+        [(output != column).astype(float), jnp.ones((o, 1))], axis=-1
+    )
+
+
+class GLASSOADMMState(NamedTuple):
+    """Format-4 state, kept only so pickles written before the ADMM port still load.
+
+    Nothing constructs one any more; admm_state_from_legacy converts it. Pickle looks the
+    class up by module and name, so deleting it would make every old result unreadable,
+    not just unusable as a warmstart.
+    """
+
+    x: Float[Array, "o d*g+1"]
+    z: Float[Array, "o d*g+1"]
+    u: Float[Array, "o d*g+1"]
+    rho: Scalar
+    l1: Scalar
+    group_size: int
+    bounds: Optional[Float[Array, "2 o d*g+1"]] = None
+    g_min: Scalar = jnp.array(1e-4)
+    g_max: Scalar = jnp.array(1.0)
+
+
+def admm_state_from_legacy(legacy: GLASSOADMMState) -> ADMMState:
+    """Format-4 (o, d*g+1) iterates -> the (... g) layout, nugget moved into aux.
+
+    Lossless: the theta and w parametrizations are unchanged, only the layout is, and the
+    w column satisfied x = z with u = 0 identically, which is what aux now expresses.
+    """
+    x, z, u = (
+        admm.to_groups(v[:, :-1], legacy.group_size)
+        for v in (legacy.x, legacy.z, legacy.u)
+    )
+    return ADMMState(x=x, z=z, u=u, rho=legacy.rho, aux=legacy.x[:, -1])
+
+
+def admm_state_from_pickle(results: dict) -> ADMMState:
+    """The state out of a result pickle, converting the format-4 layout if it is one."""
+    state = results["admm_state"]
+    if isinstance(state, GLASSOADMMState):
+        return admm_state_from_legacy(state)
+    return state
+
+
+@eqx.filter_jit
+def x_update_solve(
+    x0: Float[Array, "o d*g+1"],
+    target_theta: Float[Array, "o d*g"],
+    rho: Scalar,
+    masked_designs: Float[Array, "n_groups n d*g"],
+    y_train: Float[Array, "n o"],
+    group_size: int,
+    mask: Optional[Float[Array, "o d*g+1"]] = None,
+    g_min: Scalar = jnp.array(1e-4),
+    g_max: Scalar = jnp.array(1.0),
+    maxiter: int = 50,
+    chunk_size: int = 8,
+    history_length: int = 40,
+    rtol: float = 1e-4,
+    atol: float = 1e-4,
+) -> Float[Array, "o d*g+1"]:
+    """Solve the o independent smooth subproblems, chunk_size of them at a time.
+
+    L-BFGS over an x whose negative part the likelihood cannot see (the relu in
+    admm_x_update_loss). The caller projects the result onto the theta box, and the two
+    together are what make a dead group stable: its target is z - u = -u, so the
+    minimiser sits at a negative theta on a likelihood plateau and the projection clips
+    it to exactly zero. A long history matters, measured 221 steps at 40 against 735 at
+    the default 10 and 627 for dense BFGS.
+
+    rtol/atol are a *step* criterion, not a gradient one, so they are far looser than a
+    gradient tolerance of the same magnitude: at 1e-4 the cold x-update reaches the same
+    augmented-Lagrangian value as 1.49e-8 (relative 4e-6) in half the steps.
+    """
+    solver = optx.LBFGS(rtol=rtol, atol=atol, history_length=history_length)
+    x0 = x0 if mask is None else x0 * mask
+    group_of_output = jnp.arange(len(x0)) // group_size
+
+    def solve_one_output(args) -> Float[Array, "d*g+1"]:
+        x0_i, target_i, y_i, group_i, mask_i = args
+        solution = optx.minimise(
+            admm_x_update_loss,
+            solver,
+            x0_i,
+            args=(target_i, rho, masked_designs[group_i], y_i, g_min, g_max),
+            max_steps=maxiter,
+            throw=False,
+        )
+        return solution.value * mask_i
+
+    # lax.map with a batch size is a chunked vmap: it trades the o*n*n kernels a full
+    # vmap would hold live against keeping the device fed
+    return jax.lax.map(
+        solve_one_output,
+        (
+            x0,
+            target_theta,
+            y_train.T,
+            group_of_output,
+            jnp.ones_like(x0) if mask is None else mask,
+        ),
+        batch_size=chunk_size,
+    )
+
+
+class GroupLassoGaussianProcess(NamedTuple):
+    theta: Float[Array, "o d*g"]
+    g: Float[Array, "o"]
+    b: Float[Array, "o"]
+    nu: Float[Array, "o"]
+
+    x_train: Float[Array, "n d*g"]
+    y_train: Float[Array, "n o"]
+
+    @eqx.filter_jit
+    def predict(
+        self, xs: Float[Array, "m d*g"], covariance: bool = False
+    ) -> Float[Array, "o m"] | tuple[Float[Array, "o m"], Float[Array, "o m m"]]:
+        def predict_single_output(
+            theta: Float[Array, "d*g"],
+            g: Scalar,
+            b: Scalar,
+            nu: Scalar,
+            y_train: Float[Array, "n"],
+        ) -> Float[Array, "m"] | tuple[Float[Array, "m"], Float[Array, "m m"]]:
+            Kox = nu * kernel(theta, self.x_train, xs)
+            Koo = nu * (
+                kernel(theta, self.x_train, self.x_train)
+                + g * jnp.eye(len(self.y_train))
+            )
+            Kxx = nu * kernel(theta, xs, xs) if covariance else None
+            return gp_posterior(Kox, Koo, y_train, b, Kxx)
+
+        # scan over outputs instead of vmap: only one n*n kernel is live at a time
+        _, posterior = jax.lax.scan(
+            lambda _, args: (_, predict_single_output(*args)),
+            None,
+            (self.theta, self.g, self.b, self.nu, self.y_train.T),
+        )
+        return posterior
+
+    @classmethod
+    @eqx.filter_jit
+    def unpack_parameters(
+        cls,
+        admm_theta: Float[Array, "o d*g"],
+        admm_w: Float[Array, "o"],
+        x_train: Float[Array, "n d*g"],
+        y_train: Float[Array, "n o"],
+        g_min: Scalar = jnp.array(1e-4),
+        g_max: Scalar = jnp.array(1.0),
+    ) -> tuple[Self, Scalar]:
+        # infer the rest; theta is reported as its magnitude, which is the equivalent
+        # point in the old nonnegative orthant
+        theta = jnp.abs(admm_theta)
+        g = nugget_from_w(admm_w, g_min, g_max)
+
+        # use scan instead of vmap over theta to avoid OOM
+        def unpack_single_output(
+            theta: Float[Array, "d*g"],
+            g: Scalar,
+            y_train: Float[Array, "n"],
+        ) -> tuple[Scalar, Scalar, Scalar]:
+            Koo = kernel(theta, x_train, x_train) + g * jnp.eye(len(y_train))
+            return loglikelihood(Koo, y_train)
+
+        _, (llk, b, nu) = jax.lax.scan(
+            lambda _, args: (_, unpack_single_output(*args)),
+            None,
+            (theta, g, y_train.T),
+        )
+        self = cls(theta, g, b, nu, x_train, y_train)
+        return self, llk.sum()
+
+    @classmethod
+    def fit(
+        cls,
+        x_train: Float[Array, "n d*g"],
+        y_train: Float[Array, "n o"],
+        l1_penalty: Scalar,
+        group_size: int,
+        autoregressive: bool = True,
+        *,
+        warmstart: Optional["Self | ADMMState"] = None,
+        auto_bounds: Optional[
+            tuple[Float[np.ndarray, "d"], Float[np.ndarray, "d"]]
+        ] = None,
+        # the ceiling used to be 1.0, which 32% of real outputs sat exactly on: an
+        # output noisier than its signal cannot say so, and the saturated ridge costs
+        # iterations (103 against 52 on the toy fit). Measured identical at 10/100/1000
+        g_range: tuple[float, float] = (1e-4, 100.0),
+        g_init: float = 0.1,
+        max_iterations: int = 300,
+        tol: Scalar = jnp.array(1e-3),
+        adapt_rho: bool = True,
+        adapt_rho_iters: Optional[int] = None,
+        # plain ADMM, deliberately: Boyd's 1.5-1.8 band is wrong for this problem. See
+        # admm.z_and_u_update for why over-relaxation and the theta box are incompatible.
+        alpha: float = 1.0,
+        inner_maxiter: int = 50,
+        inner_maxiter_init: int = 20,
+        inner_rtol: float = 1e-4,
+        inner_atol: float = 1e-4,
+        chunk_size: int = 8,
+        history_length: int = 40,
+        # tqdm goes to stderr and only shows the latest iteration; a periodic stdout row
+        # is what makes a residual that stalls distinguishable from one still falling
+        log_every: int = 0,
+    ) -> tuple[Self, Scalar, ADMMState, dict]:
+        _, d_times_g = x_train.shape
+        _, o = y_train.shape
+        assert d_times_g % group_size == 0
+
+        # data-driven (hetgpy) lengthscale bounds; they only depend on x_train, so a
+        # lambda sweep computes them once and passes them in
+        lower, upper = auto_bounds or hetgpy_auto_bounds(x_train)
+        # theta >= 0 is not a statistical constraint -- the objective is even, so -theta
+        # and theta are the same model -- but it is what lets a dead group sit at exactly
+        # zero instead of limit-cycling between the two wells. See x_update_solve.
+        theta_max = admm.to_groups(
+            jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g)), group_size
+        )
+        bounds = jnp.stack([jnp.zeros_like(theta_max), theta_max], axis=0)
+        theta_init = admm.to_groups(
+            jnp.broadcast_to(
+                jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d_times_g)
+            ),
+            group_size,
+        )
+        # the nugget is an aux variable, not part of the consensus, so it needs no bound
+        # at all: it saturates into g_range instead of being clipped. It used to be a
+        # clipped column of x, and outputs whose noise exceeded g_range[1] then held the
+        # primal residual permanently above tol -- no lambda could ever converge.
+        g_min, g_max = jnp.array(g_range[0]), jnp.array(g_range[1])
+        w_init = jnp.full((o,), w_from_nugget(jnp.array(g_init), g_min, g_max))
+        state = ADMMState.initialize(theta_init, aux=w_init)
+
+        # warmstart the whole ADMM state (dual variable and rho included) from the
+        # neighbouring lambda; a fitted model alone only carries the parameters
+        if isinstance(warmstart, ADMMState):
+            state = warmstart
+        elif warmstart is not None:
+            # a fitted model reports g in the linear space the state optimizes as w
+            theta = admm.to_groups(warmstart.theta, group_size)
+            w = w_from_nugget(warmstart.g, g_min, g_max)
+            state = state._replace(x=theta, z=theta, aux=w)
+
+        # each output must not see its own marker group: one masked design per group,
+        # indexed by group rather than replicated per output
+        n_groups = d_times_g // group_size
+        if autoregressive:
+            group_columns = jnp.arange(d_times_g)[None, :] // group_size
+            keep = (jnp.arange(n_groups)[:, None] != group_columns).astype(
+                x_train.dtype
+            )
+            masked_designs = x_train[None, :, :] * keep[:, None, :]
+            mask = autoregressive_mask(o, d_times_g, group_size)
+        else:
+            masked_designs = jnp.broadcast_to(x_train, (n_groups, *x_train.shape))
+            mask = None
+
+        def x_update(state: ADMMState, iteration: int) -> tuple[ADMMState, bool]:
+            # inexact early on: a tight x-update is wasted while z-u is still moving, and
+            # reporting exactness only at the cap stops a cheap iteration faking convergence
+            maxiter = min(inner_maxiter, inner_maxiter_init * 2**iteration)
+            theta = admm.to_outputs(state.x, group_size)
+            solution = x_update_solve(
+                jnp.concat([theta, state.aux[..., None]], axis=-1),
+                admm.to_outputs(state.z - state.u, group_size),
+                state.rho,
+                masked_designs,
+                y_train,
+                group_size,
+                mask=mask,
+                g_min=g_min,
+                g_max=g_max,
+                maxiter=maxiter,
+                chunk_size=chunk_size,
+                history_length=history_length,
+                rtol=inner_rtol,
+                atol=inner_atol,
+            )
+            # project onto the same box z lives in, so a group the prox is killing reaches
+            # exactly zero rather than the unconstrained minimiser near -u
+            theta = admm.to_groups(solution[:, :-1], group_size)
+            state = state._replace(x=jnp.clip(theta, *bounds), aux=solution[:, -1])
+            return state, maxiter == inner_maxiter
+
+        state, info = admm.solve(
+            x_update,
+            state,
+            l1_penalty,
+            max_iterations=max_iterations,
+            tol=tol,
+            bounds=bounds,
+            alpha=alpha,
+            adapt_rho=adapt_rho,
+            adapt_rho_iters=adapt_rho_iters,
+            log_every=log_every,
+        )
+
+        # report z, not x: the prox output is the iterate carrying exact zeros now that
+        # the smooth solver no longer pins coordinates against a lower bound
+        theta = admm.to_outputs(state.z, group_size)
+        theta = theta if mask is None else theta * mask[:, :-1]
+        self, llk = cls.unpack_parameters(
+            theta, state.aux, x_train, y_train, g_min=g_min, g_max=g_max
+        )
+        return self, llk, state, info
