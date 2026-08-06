@@ -80,7 +80,10 @@ class InclineRunning:
         valid = ~np.isnan(x).any(axis=1) & ~np.isnan(y).any(axis=1)
         x, y = x[valid], y[valid]
 
-        # train-test split
+        # DEBT: even/odd rows are consecutive mocap frames, so test is not
+        # independent of train and every R² here is optimistic. Kept
+        # deliberately while sanity-checking; replace with a blocked split
+        # before believing any result.
         self.x_train, self.x_test = x[::2, :], x[1::2, :]
         self.y_train, self.y_test = y[::2, :], y[1::2, :]
         print("train:", self.x_train.shape, self.y_train.shape)

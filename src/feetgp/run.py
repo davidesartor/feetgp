@@ -155,18 +155,26 @@ if __name__ == "__main__":
     # Record what produced this run, so plots.py does not have to
     # reverse-engineer it from the directory name
     ############################################################
-    def git_revision() -> str | None:
+    def git_revision() -> tuple[str | None, bool]:
         try:
+            git_dir = os.path.dirname(os.path.abspath(__file__))
             rev = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=os.path.dirname(os.path.abspath(__file__)),
+                cwd=git_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=git_dir,
                 capture_output=True,
                 text=True,
                 check=True,
             )
         except (subprocess.CalledProcessError, OSError):
-            return None
-        return rev.stdout.strip()
+            return None, False
+        return rev.stdout.strip(), bool(status.stdout.strip())
 
     def group_label(columns: list[str]) -> str:
         """Name a penalty group from its columns: LCAL1+RCAL1 -> CAL1, LCAL1 -> L CAL1."""
@@ -175,12 +183,21 @@ if __name__ == "__main__":
             return f"{names[0][0]} {names[0][1:]}"
         return names[0][1:]
 
+    revision, dirty = git_revision()
+    if dirty:
+        print(
+            "=" * 72 + "\nWARNING: git tree is DIRTY — meta.json will record"
+            f" {revision} + dirty=true.\nCommit before any run whose results"
+            " you intend to keep.\n" + "=" * 72
+        )
+
     meta = dict(
         args=vars(args),
         group_size=group_size,
         autoregressive=autoregressive,
         run_name=run_name,
-        git_revision=git_revision(),
+        git_revision=revision,
+        git_dirty=dirty,
         x_columns=data.x_columns,
         y_columns=data.y_columns,
         group_labels=[
