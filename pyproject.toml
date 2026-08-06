@@ -20,6 +20,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "joblib>=1.5.3",
     "optimistix>=0.1.0",
+    "jaxvlse>=0.1.1",
 ]
 
 [build-system]
@@ -31,7 +32,6 @@ packages = ["src/feetgp"]
 
 [dependency-groups]
 dev = [
-    "jaxvlse>=0.0.0",
     "pytest>=9.1.1",
     "scipy>=1.17.0",
 ]

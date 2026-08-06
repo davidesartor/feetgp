@@ -281,6 +281,7 @@ dependencies = [
     { name = "ipykernel" },
     { name = "jax", extra = ["cuda"] },
     { name = "jaxtyping" },
+    { name = "jaxvlse" },
     { name = "joblib" },
     { name = "matplotlib" },
     { name = "nbformat" },
@@ -295,7 +296,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "jaxvlse" },
     { name = "pytest" },
     { name = "scipy" },
 ]
@@ -307,6 +307,7 @@ requires-dist = [
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "jax", extras = ["cuda"], specifier = ">=0.9.0.1" },
     { name = "jaxtyping", specifier = ">=0.3.7" },
+    { name = "jaxvlse", specifier = ">=0.1.1" },
     { name = "joblib", specifier = ">=1.5.3" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "nbformat", specifier = ">=5.10.4" },
@@ -321,7 +322,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "jaxvlse", specifier = ">=0.0.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "scipy", specifier = ">=1.17.0" },
 ]
@@ -544,16 +544,16 @@ wheels = [
 
 [[package]]
 name = "jaxvlse"
-version = "0.0.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "equinox" },
     { name = "jax" },
     { name = "jaxtyping" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b0/db/44fa3d86a8c8e52bfc5d5a92782e9614ab8e49c4b22a0199590c7697619d/jaxvlse-0.0.0.tar.gz", hash = "sha256:0900c0851dfdbc72e543cdb6ddf3c829684b49a58b9d582efb33e37ab783aa59", size = 20356, upload-time = "2026-08-03T14:26:31.965Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/87/b8b68a4beac57a08d12108d8ecc87bd3f305c5cdaf69c326a03bfdd05e26/jaxvlse-0.1.1.tar.gz", hash = "sha256:3f2655b71d1a88aead37c587c7efa521750c7cb2b9b4cae678e0e9f713547ddb", size = 30494, upload-time = "2026-08-06T20:39:48.087Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/71/9f/b7734939f33f6668db8af5edd665b6e46df935f0442c7623e65e2843d2e0/jaxvlse-0.0.0-py3-none-any.whl", hash = "sha256:c575bc7a4b08096dae2eb46214527f3adf365c6cfc7f03bbbf81e51b2cee95af", size = 26035, upload-time = "2026-08-03T14:26:30.832Z" },
+    { url = "https://files.pythonhosted.org/packages/41/6f/a6d6a1f9f6eddcf0602932188a1361060761a2bbaeebb1903e933b947387/jaxvlse-0.1.1-py3-none-any.whl", hash = "sha256:4bf60ab8297853ee7bbdd87d3371d1d5b722ff4ecf3d8c574e888d6b980c0360", size = 33892, upload-time = "2026-08-06T20:39:48.992Z" },
 ]
 
 [[package]]

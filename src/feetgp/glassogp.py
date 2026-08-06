@@ -14,10 +14,9 @@ from scipy.spatial.distance import cdist
 from feetgp import admm
 from feetgp.admm import ADMMState
 
-# jaxvlse 0.1.0 is not released yet, so the bounded x-update is opt-in and the
-# optimistix one stays the default
+# the bounded x-update is opt-in (--solver lbfgsb); optimistix stays the default
 try:
-    from vlse.lbfgsb import minimise as lbfgsb_minimise
+    from vlse.optim import minimise as lbfgsb_minimise
 except ImportError:
     lbfgsb_minimise = None
 
@@ -298,9 +297,7 @@ def x_update_solve_bounded(
     digits and the same projected gradient.
     """
     if lbfgsb_minimise is None:
-        raise ImportError(
-            "the bounded x-update needs vlse.lbfgsb: `uv add jaxvlse` once 0.1.0 ships"
-        )
+        raise ImportError("the bounded x-update needs vlse.optim: `uv add jaxvlse`")
     x0 = x0 if mask is None else x0 * mask
     lower, upper = bounds
     group_of_output = jnp.arange(len(x0)) // group_size

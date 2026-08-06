@@ -76,7 +76,7 @@ if __name__ == "__main__":
     # "optimistix" is unconstrained L-BFGS plus a projection onto the box, "lbfgsb" is
     # vlse's bounded solver. Measured at one knot from a single warmstart, lbfgsb took
     # 67.4s and 16 ADMM iterations against optimistix's 488.7s and 35, at equal-or-better
-    # loglik -- but vlse 0.1.0 is not released, so optimistix stays the default
+    # loglik -- but that is a single knot, so optimistix stays the default
     parser.add_argument(
         "--solver", choices=("optimistix", "lbfgsb"), default="optimistix"
     )

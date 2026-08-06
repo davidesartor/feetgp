@@ -1,4 +1,4 @@
-"""Wall-clock of vlse's lbfgsb.minimise against scipy's Fortran L-BFGS-B on the vlse battery."""
+"""Wall-clock of vlse's optim.minimise against scipy's Fortran L-BFGS-B on the vlse battery."""
 
 import argparse
 import json
@@ -11,7 +11,7 @@ import numpy as np
 import vlse
 from scipy.optimize import Bounds, minimize as scipy_minimize
 
-from vlse.lbfgsb import minimise
+from vlse.optim import minimise
 
 jax.config.update("jax_enable_x64", True)
 

@@ -14,9 +14,7 @@ from scipy.optimize import minimize as scipy_minimize
 
 from feetgp.glassogp import admm_x_update_loss, nugget_from_w
 
-minimise = pytest.importorskip(
-    "vlse.lbfgsb", reason="jaxvlse 0.1.0 is not released yet"
-).minimise
+minimise = pytest.importorskip("vlse.optim", reason="jaxvlse is not installed").minimise
 
 jax.config.update("jax_enable_x64", True)
 

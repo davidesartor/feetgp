@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from vlse.lbfgsb import minimise
+from vlse.optim import minimise
 
 from feetgp import admm
 from feetgp.glassogp import (
