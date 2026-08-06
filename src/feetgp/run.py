@@ -301,6 +301,12 @@ if __name__ == "__main__":
         print(f"    max gnorm = {gn.max():.4f}")
         print(f"    r2 (test)  = [{r2_test.min():.3f}, {r2_test.max():.3f}]")
         print(f"    r2 (train) = [{r2_train.min():.3f}, {r2_train.max():.3f}]")
+        certificate = info.get("certificate")
+        if certificate is not None:
+            print(
+                f"    max live KKT = {float(certificate['max_live_kkt']):.3e}"
+                f" (nugget grad {float(certificate['nugget_grad']):.3e})"
+            )
 
         # remove the training data from the model before saving, to reduce pickle size
         results = dict(

@@ -161,6 +161,113 @@ def autoregressive_mask(
     )
 
 
+def theta_box(
+    lower: Float[np.ndarray, "d*g"], o: int, d_times_g: int, group_size: int
+) -> Float[Array, "2 d o*g"]:
+    """The [0, sqrt(2/lower)] box in group layout, shared by fit and the certificate."""
+    theta_max = admm.to_groups(
+        jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g)), group_size
+    )
+    return jnp.stack([jnp.zeros_like(theta_max), theta_max], axis=0)
+
+
+@eqx.filter_jit
+def penalized_objective(
+    theta: Float[Array, "o d*g"],
+    g: Float[Array, "o"],
+    l1: Scalar,
+    x_train: Float[Array, "n d*g"],
+    y_train: Float[Array, "n o"],
+    group_size: int,
+) -> Scalar:
+    """True nonsmooth objective sum_o -loglik_o + l1 sum_g ||theta_g||; ranks starts."""
+    n = len(x_train)
+
+    def negloglik_single_output(
+        theta_i: Float[Array, "d*g"], g_i: Scalar, y_i: Float[Array, "n"]
+    ) -> Scalar:
+        Koo = kernel(theta_i, x_train, x_train) + g_i * jnp.eye(n)
+        loglik, _, _ = loglikelihood(Koo, y_i)
+        return -loglik
+
+    # scan over outputs, one n*n kernel live at a time
+    _, negloglik = jax.lax.scan(
+        lambda _, inputs: (_, negloglik_single_output(*inputs)),
+        None,
+        (theta, g, y_train.T),
+    )
+    norms = jnp.linalg.norm(admm.to_groups(theta, group_size), axis=-1)
+    return negloglik.sum() + l1 * norms.sum()
+
+
+@eqx.filter_jit
+def kkt_certificate(
+    theta: Float[Array, "o d*g"],
+    w: Float[Array, "o"],
+    l1: Scalar,
+    x_train: Float[Array, "n d*g"],
+    y_train: Float[Array, "n o"],
+    group_size: int,
+    bounds: Float[Array, "2 d o*g"],
+    mask: Optional[Float[Array, "o d*g+1"]] = None,
+    g_min: Scalar = jnp.array(1e-4),
+    g_max: Scalar = jnp.array(100.0),
+    chunk_size: int = 8,
+) -> dict:
+    """First-order optimality of (theta, w), independent of the ADMM residual test.
+
+    Live groups get the box-projected stationarity residual of f + l1||theta_g||; dead
+    groups get the subgradient slack l1 - ||grad_g f||, which the even objective makes
+    trivially l1 -- recorded anyway, to document that only local optimality is certified
+    (multi-start is what compensates). The nugget check is the plain gradient in w, the
+    unbounded coordinate the solver actually optimizes.
+    """
+    n = len(x_train)
+
+    def negloglik_single_output(
+        theta_i: Float[Array, "d*g"], w_i: Scalar, y_i: Float[Array, "n"]
+    ) -> Scalar:
+        Koo = kernel(theta_i, x_train, x_train) + nugget_from_w(
+            w_i, g_min, g_max
+        ) * jnp.eye(n)
+        loglik, _, _ = loglikelihood(Koo, y_i)
+        return -loglik
+
+    # chunked gradient sweep over outputs; autoregressive coordinates are structural
+    # zeros, not optimization variables, so their gradient is masked out
+    grad_theta, grad_w = jax.lax.map(
+        lambda inputs: jax.grad(negloglik_single_output, argnums=(0, 1))(*inputs),
+        (theta, w, y_train.T),
+        batch_size=chunk_size,
+    )
+    if mask is not None:
+        grad_theta = grad_theta * mask[:, :-1]
+
+    grad_groups = admm.to_groups(grad_theta, group_size)
+    theta_groups = admm.to_groups(theta, group_size)
+    norms = jnp.linalg.norm(theta_groups, axis=-1)
+    live = norms > 0.0
+
+    # box projection: at an active bound, only the component pushing outward counts
+    direction = theta_groups / jnp.where(live, norms, 1.0)[:, None]
+    stationarity = grad_groups + l1 * direction
+    lower, upper = bounds
+    stationarity = jnp.where(
+        theta_groups <= lower, jnp.minimum(stationarity, 0.0), stationarity
+    )
+    stationarity = jnp.where(
+        theta_groups >= upper, jnp.maximum(stationarity, 0.0), stationarity
+    )
+    live_kkt = jnp.linalg.norm(stationarity, axis=-1)
+    dead_slack = l1 - jnp.linalg.norm(grad_groups, axis=-1)
+    return dict(
+        max_live_kkt=jnp.max(jnp.where(live, live_kkt, 0.0)),
+        live_kkt=jnp.where(live, live_kkt, jnp.nan),
+        dead_slack=jnp.where(live, jnp.nan, dead_slack),
+        nugget_grad=jnp.max(jnp.abs(grad_w)),
+    )
+
+
 class GLASSOADMMState(NamedTuple):
     """Format-4 state, kept only so pickles written before the ADMM port still load.
 
@@ -462,10 +569,7 @@ class GroupLassoGaussianProcess(NamedTuple):
         # theta >= 0 is not a statistical constraint -- the objective is even, so -theta
         # and theta are the same model -- but it is what lets a dead group sit at exactly
         # zero instead of limit-cycling between the two wells. See x_update_solve.
-        theta_max = admm.to_groups(
-            jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d_times_g)), group_size
-        )
-        bounds = jnp.stack([jnp.zeros_like(theta_max), theta_max], axis=0)
+        bounds = theta_box(lower, o, d_times_g, group_size)
         # the same box in the layout the inner solver wants, one row per output, with the
         # nugget column left unbounded because w saturates rather than being clipped
         unbounded = jnp.full((o, 1), jnp.inf)
@@ -579,4 +683,22 @@ class GroupLassoGaussianProcess(NamedTuple):
         self, llk = cls.unpack_parameters(
             theta, state.aux, x_train, y_train, g_min=g_min, g_max=g_max
         )
+
+        # optimality of the reported solution, independent of the ADMM stopping test:
+        # converged=True has been measured grazing its tolerance at 0.999x, so the
+        # certificate, not the stamp, is what downstream reporting should trust
+        certificate = kkt_certificate(
+            self.theta,
+            state.aux,
+            l1_penalty,
+            x_train,
+            y_train,
+            group_size,
+            bounds,
+            mask=mask,
+            g_min=g_min,
+            g_max=g_max,
+            chunk_size=chunk_size,
+        )
+        info["certificate"] = {k: np.asarray(v) for k, v in certificate.items()}
         return self, llk, state, info
