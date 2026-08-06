@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from einops import rearrange
 from sklearn.metrics import r2_score
 
+from feetgp import admm
 from feetgp import glassogp
 from feetgp import linear
 from feetgp.glassogp import GroupLassoGaussianProcess, hetgpy_auto_bounds
@@ -103,6 +104,12 @@ if __name__ == "__main__":
     # a geometric grid spreads points evenly in log lambda, but the deaths are not
     # spread evenly, so uniform refinement is mostly wasted on the flat ends
     parser.add_argument("--lambda_refine", type=int, default=25)
+    # GP fits per lambda: chained warmstart, dense (lambda=0) start, then randoms. The
+    # objective is even in theta, so death is absorbing and a single chained start bakes
+    # continuation bias into the path; with the dense start in the race at every lambda
+    # the winner is chosen by the true penalized objective instead. 1 restores the old
+    # single-start behavior; the linear model is convex and always runs one start
+    parser.add_argument("--n_starts", type=int, default=3)
     # by default an existing lambda pickle is reused (resume); --overwrite refits
     parser.add_argument("--overwrite", action="store_true", default=False)
     args = parser.parse_args()
@@ -264,6 +271,74 @@ if __name__ == "__main__":
             log_every=args.log_every,
         )
 
+    def random_start(l1_penalty: float, k: int) -> admm.ADMMState:
+        """Fresh ADMM state, theta log-uniform inside the hetgpy lengthscale band."""
+        # seeded from (k, lambda bits) so a resumed run redraws the same starts
+        rng = np.random.default_rng([k, int(np.float64(l1_penalty).view(np.uint64))])
+        lower, upper = auto_bounds
+        low, high = np.sqrt(2.0 / upper), np.sqrt(2.0 / lower)
+        theta = np.exp(rng.uniform(np.log(low), np.log(high), size=(o, d)))
+        g_min, g_max = (jnp.array(g) for g in glassogp.G_RANGE)
+        w = glassogp.w_from_nugget(jnp.array(0.1), g_min, g_max)
+        return admm.ADMMState.initialize(
+            admm.to_groups(jnp.asarray(theta), group_size),
+            aux=jnp.full((o,), float(w)),
+        )
+
+    def fit_multistart(l1_penalty: float, warmstart=None):
+        """Fit from several starts, winner by the true penalized objective.
+
+        The chained warmstart carries continuation bias -- death is absorbing, so it can
+        only lose groups -- and the dense lambda=0 start is what can win them back.
+        """
+        if args.linear_model or args.n_starts == 1:
+            return fit(l1_penalty, warmstart=warmstart)
+
+        starts = [("chained" if warmstart is not None else "default", warmstart)]
+        if l1_penalty > 0 and states.get(0.0) is not None:
+            # rho reset as for the chained handoff: lambda=0 walks rho to RHO_MIN, where
+            # the prox threshold l1 / (rho * norm) kills every group on contact
+            starts.append(("dense", states[0.0]._replace(rho=jnp.array(1.0))))
+        while len(starts) < args.n_starts:
+            starts.append(
+                (f"random_{len(starts)}", random_start(l1_penalty, len(starts)))
+            )
+        starts = starts[: args.n_starts]
+
+        print(f"lambda = {l1_penalty:.4g}, {len(starts)} starts")
+        fits = {}
+        for label, start in starts:
+            model, llk, state, info = fit(l1_penalty, warmstart=start)
+            objective = float(
+                glassogp.penalized_objective(
+                    model.theta,
+                    model.g,
+                    jnp.asarray(l1_penalty),
+                    x_train,
+                    y_train,
+                    group_size,
+                )
+            )
+            fits[label] = (objective, model, llk, state, info)
+            print(
+                f"    start {label}: objective = {objective:.6f},"
+                f" converged = {info['converged']} in {info['iterations']} iterations"
+            )
+
+        winner = min(fits, key=lambda label: fits[label][0])
+        objective, model, llk, state, info = fits[winner]
+        info["winner"] = winner
+        info["start_objectives"] = {label: fits[label][0] for label in fits}
+        info["starts"] = {
+            label: dict(
+                converged=bool(fits[label][4]["converged"]),
+                iterations=int(fits[label][4]["iterations"]),
+            )
+            for label in fits
+        }
+        print(f"    winner = {winner}")
+        return model, llk, state, info
+
     def group_norms(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
     ) -> Float[NDArray, "d"]:
@@ -352,7 +427,7 @@ if __name__ == "__main__":
                 )
                 return results, None
             return results, state
-        model, llk, state, info = fit(l1_penalty, warmstart=warmstart)
+        model, llk, state, info = fit_multistart(l1_penalty, warmstart=warmstart)
         results = record(l1_penalty, model, llk, state, info)
         return results, state
 

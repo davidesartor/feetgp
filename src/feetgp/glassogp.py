@@ -22,6 +22,10 @@ except ImportError:
 
 jax.config.update("jax_enable_x64", True)
 
+# the nugget's reachable range. The floor stops the likelihood running away to
+# interpolation as g -> 0; the ceiling leaves room for outputs noisier than their signal
+G_RANGE = (1e-4, 100.0)
+
 
 @jax.jit
 def kernel(
@@ -525,7 +529,7 @@ class GroupLassoGaussianProcess(NamedTuple):
         # the ceiling used to be 1.0, which 32% of real outputs sat exactly on: an
         # output noisier than its signal cannot say so, and the saturated ridge costs
         # iterations (103 against 52 on the toy fit). Measured identical at 10/100/1000
-        g_range: tuple[float, float] = (1e-4, 100.0),
+        g_range: tuple[float, float] = G_RANGE,
         g_init: float = 0.1,
         max_iterations: int = 300,
         tol: Scalar = jnp.array(1e-3),
