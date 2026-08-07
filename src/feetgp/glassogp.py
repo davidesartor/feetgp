@@ -26,6 +26,11 @@ jax.config.update("jax_enable_x64", True)
 # interpolation as g -> 0; the ceiling leaves room for outputs noisier than their signal
 G_RANGE = (1e-4, 100.0)
 
+# provisional pass/fail line on max_live_kkt for reporting; recalibrate once a real
+# path has been measured. Certificates are stored raw in the pickles, so changing this
+# reinterprets old runs without refitting them
+CERTIFICATE_TOLERANCE = 1e-2
+
 
 @jax.jit
 def kernel(

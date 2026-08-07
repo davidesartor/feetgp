@@ -8,6 +8,8 @@ from einops import rearrange
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from feetgp.glassogp import CERTIFICATE_TOLERANCE
+
 MARKERS = [
     "CAL1",
     "CUB",
@@ -53,14 +55,22 @@ def load_run(run_dir: str) -> dict | None:
         r2_train = (
             np.asarray(r["r2_train"]) if "r2_train" in r else np.full_like(r2, np.nan)
         )
+        # trust the KKT certificate where one exists: the converged stamp has been
+        # measured grazing its own tolerance at 0.999x. Older pickles fall back to the
+        # stamp, and ones predating the info key cannot say either way
+        info = r.get("info", {})
+        certificate = info.get("certificate")
+        if certificate is not None:
+            trusted = float(certificate["max_live_kkt"]) <= CERTIFICATE_TOLERANCE
+        else:
+            trusted = info.get("converged", True)
         results.append(
             {
                 "l1_penalty": r["l1_penalty"],
                 "group_norms": np.asarray(r["group_norms"]),
                 "r2": r2,
                 "r2_train": r2_train,
-                # pickles predating the info key cannot say either way
-                "converged": r.get("info", {}).get("converged", True),
+                "trusted": trusted,
             }
         )
     results.sort(key=lambda r: r["l1_penalty"])
@@ -69,7 +79,7 @@ def load_run(run_dir: str) -> dict | None:
         "group_norms": np.stack([r["group_norms"] for r in results]),
         "r2": np.stack([r["r2"] for r in results]),
         "r2_train": np.stack([r["r2_train"] for r in results]),
-        "converged": np.array([r["converged"] for r in results]),
+        "trusted": np.array([r["trusted"] for r in results]),
     }
 
 
@@ -133,12 +143,13 @@ def plot_run(run_dir: str, results_dir: str):
     r2_train = data["r2_train"]
     n_groups = group_norms.shape[1]
 
-    # a kinked path is usually an unconverged fit, so mark those lambdas rather than
-    # leaving the reader to guess which points to trust
-    unconverged = ~data["converged"]
-    if unconverged.any():
-        print(f"  {int(unconverged.sum())}/{len(lambdas)} lambdas did not converge")
-    marker_sizes = np.where(unconverged, 7, 0)
+    # a kinked path is usually a bad fit, so mark the untrusted lambdas (certificate
+    # failure, or unconverged for pickles without one) rather than leaving the reader
+    # to guess which points to believe
+    untrusted = ~data["trusted"]
+    if untrusted.any():
+        print(f"  {int(untrusted.sum())}/{len(lambdas)} lambdas failed certification")
+    marker_sizes = np.where(untrusted, 7, 0)
     marker_style = dict(size=marker_sizes, symbol="x-thin", line=dict(width=1.5))
 
     group_colors = [COLORS[j % len(COLORS)] for j in range(n_groups)]
