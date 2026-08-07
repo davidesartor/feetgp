@@ -295,7 +295,14 @@ if __name__ == "__main__":
             return fit(l1_penalty, warmstart=warmstart)
 
         starts = [("chained" if warmstart is not None else "default", warmstart)]
-        if l1_penalty > 0 and states.get(0.0) is not None:
+        # at the first lambda above 0 the chained warmstart is itself the dense start
+        # (states[0.0] with rho reset), so racing both would fit the same start twice
+        chained_is_dense = (
+            warmstart is not None
+            and states.get(0.0) is not None
+            and warmstart.x is states[0.0].x
+        )
+        if l1_penalty > 0 and states.get(0.0) is not None and not chained_is_dense:
             # rho reset as for the chained handoff: lambda=0 walks rho to RHO_MIN, where
             # the prox threshold l1 / (rho * norm) kills every group on contact
             starts.append(("dense", states[0.0]._replace(rho=jnp.array(1.0))))
