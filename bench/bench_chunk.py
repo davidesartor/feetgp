@@ -1,9 +1,3 @@
-"""Does widening the x-update batch to a full vmap over outputs actually pay?
-
-chunk_size == the output count is a full vmap; anything less is a sequential chain of
-that many batches. Times a fixed number of ADMM iterations at each width, warmstarted
-from a cached state so every setting solves the same problem from the same point.
-"""
 
 import argparse
 import glob
@@ -27,7 +21,6 @@ from feetgp.glassogp import (
 from feetgp.inclinerunning import InclineRunning
 
 def nearest_cached(run_dir: str, l1: float) -> tuple[str, float]:
-    """Closest cached lambda to the one asked for, so a bench never dies on a typo."""
     paths = glob.glob(f"{run_dir}/lambda=*.pkl")
     parsed = [
         (float(m.group(1)), p)

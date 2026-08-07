@@ -1,9 +1,3 @@
-"""Does the L-BFGS-B x-update beat the optimistix one, and at which projected-gradient tol?
-
-The two solvers stop on different things -- optimistix on a step, this on the infinity
-norm of the projected gradient -- so inner_tol does not carry over and has to be
-recalibrated against wall time and the residual the fit reaches.
-"""
 
 import argparse
 import functools
@@ -19,7 +13,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from feetgp.glassogp import (
+from feetgp.gp import (
     GroupLassoGaussianProcess,
     admm_state_from_pickle,
     hetgpy_auto_bounds,
@@ -28,7 +22,6 @@ from feetgp.inclinerunning import InclineRunning
 
 
 def nearest_cached(run_dir: str, l1: float) -> tuple[str, float]:
-    """Closest cached lambda to the one asked for, so a bench never dies on a typo."""
     paths = glob.glob(f"{run_dir}/lambda=*.pkl")
     parsed = [
         (float(m.group(1)), p)
@@ -49,7 +42,6 @@ parser.add_argument("--ungroup_feet", action="store_true", default=False)
 parser.add_argument("--target", type=str, default="markers")
 parser.add_argument("--maxiter", type=int, default=60)
 parser.add_argument("--chunk_size", type=int, default=39)
-parser.add_argument("--solver", choices=("optimistix", "lbfgsb"), default="lbfgsb")
 parser.add_argument("--inner_maxiters", type=int, nargs="+", default=[5])
 parser.add_argument("--inner_max_linesearch", type=int, default=5)
 parser.add_argument("--inner_tols", type=float, nargs="+", default=[1e-2, 1e-3, 1e-4])
@@ -78,7 +70,7 @@ else:
 
 
 def run(inner_tol: float, inner_maxiter: int) -> None:
-    label = f"{args.solver} inner_tol={inner_tol:g} inner_maxiter={inner_maxiter}"
+    label = f"lbfgsb inner_tol={inner_tol:g} inner_maxiter={inner_maxiter}"
     print(f"\n=== {label}")
     t0 = time.perf_counter()
     model, llk, state, info = GroupLassoGaussianProcess.fit(
@@ -92,10 +84,7 @@ def run(inner_tol: float, inner_maxiter: int) -> None:
         max_iterations=args.maxiter,
         tol=jnp.array(1e-3),
         chunk_size=args.chunk_size,
-        solver=args.solver,
         inner_maxiter=inner_maxiter,
-        inner_rtol=inner_tol,
-        inner_atol=inner_tol,
         inner_pgtol=inner_tol,
         inner_max_linesearch=args.inner_max_linesearch,
         log_every=10,

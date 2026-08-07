@@ -8,7 +8,7 @@ from einops import rearrange
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from feetgp.glassogp import CERTIFICATE_TOLERANCE
+from feetgp.gp import CERTIFICATE_TOLERANCE
 
 MARKERS = [
     "CAL1",
@@ -55,9 +55,6 @@ def load_run(run_dir: str) -> dict | None:
         r2_train = (
             np.asarray(r["r2_train"]) if "r2_train" in r else np.full_like(r2, np.nan)
         )
-        # trust the KKT certificate where one exists: the converged stamp has been
-        # measured grazing its own tolerance at 0.999x. Older pickles fall back to the
-        # stamp, and ones predating the info key cannot say either way
         info = r.get("info", {})
         certificate = info.get("certificate")
         if certificate is not None:
@@ -92,7 +89,6 @@ FORCE_LABELS = ["Fx", "Fy", "Fz"]
 
 
 def labels_from_run_dir(run_dir: str) -> tuple[int, list[str], str]:
-    """Legacy fallback for runs saved before meta.json: parse the directory name."""
     feet = "both"
     ungrouped = False
     relative_marker = None
@@ -112,7 +108,6 @@ def labels_from_run_dir(run_dir: str) -> tuple[int, list[str], str]:
         side = "L" if feet == "left_only" else "R"
         group_labels = [f"{side} {m}" for m in active_markers]
     elif ungrouped:
-        # columns interleave the two feet marker by marker: L CAL1, R CAL1, L CUB, ...
         group_labels = [f"{side} {m}" for m in active_markers for side in ("L", "R")]
     else:
         group_labels = active_markers
@@ -143,9 +138,6 @@ def plot_run(run_dir: str, results_dir: str):
     r2_train = data["r2_train"]
     n_groups = group_norms.shape[1]
 
-    # a kinked path is usually a bad fit, so mark the untrusted lambdas (certificate
-    # failure, or unconverged for pickles without one) rather than leaving the reader
-    # to guess which points to believe
     untrusted = ~data["trusted"]
     if untrusted.any():
         print(f"  {int(untrusted.sum())}/{len(lambdas)} lambdas failed certification")
@@ -157,7 +149,7 @@ def plot_run(run_dir: str, results_dir: str):
     if target == "forces":
         r2_labels = force_labels
         r2_colors = [COLORS[j % len(COLORS)] for j in range(len(force_labels))]
-        r2_summary = r2  # shape (f, 3)
+        r2_summary = r2
         r2_train_summary = r2_train
     else:
         r2_labels = group_labels

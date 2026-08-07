@@ -1,10 +1,3 @@
-"""Does ADMM oscillate between the two wells the even objective creates?
-
-The kernel sees theta only through theta**2, so -loglik is exactly even and every group
-has a stationary point at zero with two symmetric minima around it. A group the prox is
-killing gets pushed off zero by the accumulating dual, and nothing distinguishes the two
-directions. Per-group: group norms of x and z, ||u||, and how often the sign flips.
-"""
 
 import argparse
 import functools
@@ -16,9 +9,9 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from feetgp import admm
-from feetgp.admm import ADMMState
-from feetgp.glassogp import (
+from feetgp import glasso_admm
+from feetgp.glasso_admm import ADMMState
+from feetgp.gp import (
     autoregressive_mask,
     hetgpy_auto_bounds,
     w_from_nugget,
@@ -33,9 +26,8 @@ parser.add_argument("--target", type=str, default="markers")
 parser.add_argument("--l1_penalty", type=float, default=30.0)
 parser.add_argument("--iterations", type=int, default=120)
 parser.add_argument("--chunk_size", type=int, default=39)
-parser.add_argument("--inner_maxiter", type=int, default=20)
-parser.add_argument("--inner_tol", type=float, default=1e-4)
-parser.add_argument("--alpha", type=float, default=1.0)
+parser.add_argument("--inner_maxiter", type=int, default=5)
+parser.add_argument("--inner_tol", type=float, default=1e-2)
 parser.add_argument("--adapt_rho_iters", type=int, default=60)
 parser.add_argument("--log_every", type=int, default=5)
 args = parser.parse_args()
@@ -55,11 +47,16 @@ autoregressive = args.target == "markers"
 print(f"n={n} d={d} o={o} groups={n_groups} lambda={args.l1_penalty:g}")
 
 lower, upper = hetgpy_auto_bounds(x_train)
-theta_max = admm.to_groups(jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d)), group_size)
-theta_init = admm.to_groups(
+theta_max = glasso_admm.to_groups(jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d)), group_size)
+theta_init = glasso_admm.to_groups(
     jnp.broadcast_to(jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d)), group_size
 )
 bounds = jnp.stack([jnp.zeros_like(theta_max), theta_max])
+unbounded = jnp.full((o, 1), jnp.inf)
+solver_bounds = (
+    jnp.concat([glasso_admm.to_outputs(bounds[0], group_size), -unbounded], axis=-1),
+    jnp.concat([glasso_admm.to_outputs(bounds[1], group_size), unbounded], axis=-1),
+)
 g_min, g_max = jnp.array(1e-4), jnp.array(100.0)
 w_init = jnp.full((o,), w_from_nugget(jnp.array(0.1), g_min, g_max))
 state = ADMMState.initialize(theta_init, aux=w_init)
@@ -88,34 +85,34 @@ flips = jnp.zeros(n_groups)
 print()
 print(f"{'iter':>5} {'r':>10} {'s':>10} {'rho':>9} {'act':>4}  group norms of x")
 for iter in range(args.iterations):
-    maxiter = min(args.inner_maxiter, 20 * 2**iter)
+    maxiter = min(args.inner_maxiter, 2**iter)
     solution = x_update_solve(
         jnp.concat(
-            [admm.to_outputs(state.x, group_size), state.aux[..., None]], axis=-1
+            [glasso_admm.to_outputs(state.x, group_size), state.aux[..., None]], axis=-1
         ),
-        admm.to_outputs(state.z - state.u, group_size),
+        glasso_admm.to_outputs(state.z - state.u, group_size),
         state.rho,
         masked_designs,
         y_train,
         group_size,
+        solver_bounds,
         mask=mask,
         g_min=g_min,
         g_max=g_max,
         maxiter=maxiter,
         chunk_size=args.chunk_size,
-        rtol=args.inner_tol,
-        atol=args.inner_tol,
+        tol=args.inner_tol,
     )
-    theta = admm.to_groups(solution[:, :-1], group_size)
+    theta = glasso_admm.to_groups(solution[:, :-1], group_size)
     new_state = state._replace(x=jnp.clip(theta, *bounds), aux=solution[:, -1])
-    new_state = admm.z_and_u_update(new_state, l1, jnp.array(args.alpha), bounds)
-    primal, dual = (float(r) for r in admm.residuals(new_state, state))
+    new_state = glasso_admm.z_and_u_update(new_state, l1, bounds)
+    primal, dual = (float(r) for r in glasso_admm.residuals(new_state, state))
 
     signs = group_signs(new_state.x)
     flips = flips + (signs != previous_signs)
     previous_signs = signs
 
-    state, primal_ok, dual_ok = admm.check_residuals(
+    state, primal_ok, dual_ok = glasso_admm.check_residuals(
         new_state, state, jnp.array(1e-3), iter < args.adapt_rho_iters
     )
     if iter % args.log_every == 0:

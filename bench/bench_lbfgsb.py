@@ -1,4 +1,3 @@
-"""Wall-clock of vlse's optim.minimise against scipy's Fortran L-BFGS-B on the vlse battery."""
 
 import argparse
 import json
@@ -18,7 +17,6 @@ jax.config.update("jax_enable_x64", True)
 TOL = 1e-9
 MAX_ITERATIONS = 1000
 
-# one instance per vlse function
 BATTERY = [
     vlse.Ackley(d=5),
     vlse.Beale(),
@@ -79,7 +77,6 @@ def box_of(f):
 
 
 def timed(call, repeats):
-    """Median wall time of a call that has already been warmed up."""
     samples = []
     for _ in range(repeats):
         start = time.perf_counter()
@@ -123,7 +120,6 @@ def benchmark(f, n_starts, batch_size, repeats):
     jax.block_until_ready(solve(starts[0]))
     compile_seconds = time.perf_counter() - compile_start
 
-    # one solve at a time, which is what scipy is restricted to
     sequential = (
         timed(lambda: [jax.block_until_ready(solve(x0)) for x0 in starts], repeats)
         / n_starts
@@ -143,8 +139,6 @@ def benchmark(f, n_starts, batch_size, repeats):
     jax.block_until_ready(value_and_grad(starts[0]))
     dispatch = timed(lambda: jax.block_until_ready(value_and_grad(starts[0])), 50)
 
-    # scipy's own gradient stays on the host: charging it a GPU round trip per evaluation
-    # would measure our dispatch overhead, not its solver
     host_value_and_grad = jax.jit(jax.value_and_grad(f), backend="cpu")
     jax.block_until_ready(host_value_and_grad(np.asarray(starts[0])))
 

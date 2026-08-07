@@ -1,10 +1,3 @@
-"""Why does a lambda in the transition band floor its primal residual?
-
-Two candidate causes, one experiment. Either the inexact x-update's constant error
-(inner_maxiter is a hard cap, so the error never shrinks and inexact ADMM floors at it)
-or a prox limit cycle that a larger rho would damp. Warmstarts from the cached lambda
-below the knot, exactly as the sweep does, and reruns the knot under each setting.
-"""
 
 import argparse
 import glob
@@ -20,7 +13,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from feetgp.glassogp import (
+from feetgp.gp import (
     GroupLassoGaussianProcess,
     admm_state_from_pickle,
     hetgpy_auto_bounds,
@@ -28,7 +21,6 @@ from feetgp.glassogp import (
 from feetgp.inclinerunning import InclineRunning
 
 def nearest_cached(run_dir: str, l1: float) -> tuple[str, float]:
-    """Closest cached lambda to the one asked for, so a bench never dies on a typo."""
     paths = glob.glob(f"{run_dir}/lambda=*.pkl")
     parsed = [
         (float(m.group(1)), p)
@@ -104,6 +96,5 @@ def run(inner_maxiter: int, rho: float | None) -> None:
 
 for inner_maxiter in args.inner_maxiters:
     run(inner_maxiter, None)
-# rho is varied at the cheapest inner budget, so a win there is rho's and not the budget's
 for rho in args.rhos:
     run(min(args.inner_maxiters, default=50), rho)

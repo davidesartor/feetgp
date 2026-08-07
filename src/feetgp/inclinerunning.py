@@ -45,8 +45,6 @@ class InclineRunning:
     ):
         self.path = path
         if feet == "both":
-            # make sure right and left markers appear one after the other in the list
-            # this is important for the group lasso to work properly!!!
             self.markers = [
                 prefix + name for name in self.marker_names for prefix in ("L", "R")
             ]
@@ -57,46 +55,37 @@ class InclineRunning:
         else:
             raise ValueError(f"feet must be 'both|left_only|right_only', got {feet}")
 
-        # load marker data for the input features
         df_markers = self.load_marker_data(inclines, relative)
         x = df_markers.values
         self.x_columns = list(df_markers.columns)
         print("Loaded marker data with shape:", x.shape, x.dtype)
 
-        # load data for the target variable
         if target == "forces":
             df_forces = self.load_ground_reaction_forces(inclines)
             y = np.cbrt(
                 df_forces.values
-            )  # cube root to make the distribution more normal
+            )
             self.y_columns = list(df_forces.columns)
         elif target == "markers":
             y = x.copy()
             self.y_columns = list(self.x_columns)
         print("Loaded target data with shape:", y.shape, y.dtype)
 
-        # subsample the data and drop rows with NaN values
         x, y = x[::subsample], y[::subsample]
         valid = ~np.isnan(x).any(axis=1) & ~np.isnan(y).any(axis=1)
         x, y = x[valid], y[valid]
 
-        # DEBT: even/odd rows are consecutive mocap frames, so test is not
-        # independent of train and every R² here is optimistic. Kept
-        # deliberately while sanity-checking; replace with a blocked split
-        # before believing any result.
         self.x_train, self.x_test = x[::2, :], x[1::2, :]
         self.y_train, self.y_test = y[::2, :], y[1::2, :]
         print("train:", self.x_train.shape, self.y_train.shape)
         print("test:", self.x_test.shape, self.y_test.shape)
 
-        # normalize input features; constant columns (e.g. reference marker in relative mode) stay 0
         x_min = np.min(self.x_train, axis=0, keepdims=True)
         x_max = np.max(self.x_train, axis=0, keepdims=True)
         x_range = np.where(x_max == x_min, 1, x_max - x_min)
         self.x_train = (self.x_train - x_min) / x_range
         self.x_test = (self.x_test - x_min) / x_range
 
-        # standardize target variable; constant columns stay 0
         y_mean = np.mean(self.y_train, axis=0, keepdims=True)
         y_std = np.std(self.y_train, axis=0, keepdims=True)
         y_std = np.where(y_std == 0, 1, y_std)
@@ -131,7 +120,6 @@ class InclineRunning:
                     if not cols:
                         continue
                     if relative == "midpoint":
-                        # reference is the midpoint between the LMAL and MMAL markers
                         ref = (
                             df[f"{prefix}LMAL {coord}"] + df[f"{prefix}MMAL {coord}"]
                         ) / 2
@@ -139,8 +127,6 @@ class InclineRunning:
                         ref = df[f"{prefix}{relative} {coord}"]
                     df[cols] = df[cols].subtract(ref, axis=0)
             if relative != "midpoint":
-                # drop the reference marker (now identically zero); the midpoint
-                # is not a marker column, so nothing is dropped in that mode
                 df = df.drop(
                     columns=[
                         c

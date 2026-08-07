@@ -1,10 +1,3 @@
-"""What does one unit of inner budget buy, and what does it cost?
-
-optimistix counts one function evaluation per step; L-BFGS-B counts a whole line search
-per iteration, so the two `maxiter` arguments are not the same currency. This measures
-both in the currency that matters -- wall time and augmented-Lagrangian value reached --
-on a single real x-update.
-"""
 
 import argparse
 import functools
@@ -70,7 +63,6 @@ with open(warm_path, "rb") as f:
     warm = admm_state_from_pickle(pickle.load(f))
 print(f"warmstart {warm_path} (lambda={warm_value:.6g}, rho={float(warm.rho):.4g})")
 
-# bounds are rederived from the data, exactly as fit does
 lower_auto, _ = hetgpy_auto_bounds(x_train)
 theta_max = jnp.broadcast_to(jnp.sqrt(2.0 / lower_auto), (o, d_times_g))
 lower = jnp.concatenate([jnp.zeros((o, d_times_g)), jnp.full((o, 1), -jnp.inf)], -1)
@@ -83,7 +75,6 @@ masked_designs = x_train[None, :, :] * keep[:, None, :]
 mask = autoregressive_mask(o, d_times_g, group_size)
 group_of_output = jnp.arange(o) // group_size
 
-# the same [theta, w] the x-update starts from, and the same target it aims at
 x0 = (
     jnp.concat([admm.to_outputs(warm.x, group_size), warm.aux[..., None]], axis=-1)
     * mask
@@ -92,7 +83,6 @@ target_theta = admm.to_outputs(warm.z - warm.u, group_size)
 
 
 def x_update(maxiter: int, max_linesearch: int):
-    """One full x-update, returning the final objective and evaluation count per output."""
 
     def solve_one(args_i):
         x0_i, target_i, y_i, group_i, mask_i, lower_i, upper_i = args_i

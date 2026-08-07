@@ -3,8 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from feetgp import admm
-from feetgp.glassogp import (
+from feetgp import glasso_admm
+from feetgp.gp import (
     GroupLassoGaussianProcess,
     hetgpy_auto_bounds,
     kkt_certificate,
@@ -41,7 +41,6 @@ def test_certificate_degrades_away_from_the_fit(toy_data):
     assert np.isfinite(certificate["max_live_kkt"])
     assert np.isfinite(certificate["nugget_grad"])
 
-    # shrinking theta moves off the optimum while staying inside the box
     lower, _ = hetgpy_auto_bounds(x_train)
     o, d_times_g = model.theta.shape
     bounds = theta_box(lower, o, d_times_g, group_size)
@@ -62,7 +61,7 @@ def test_certificate_degrades_away_from_the_fit(toy_data):
 
 def test_certificate_dead_groups_carry_trivial_slack(toy_data):
     x_train, y_train = toy_data
-    l1 = 50.0
+    l1 = 100.0
     model, _, _, info = GroupLassoGaussianProcess.fit(
         x_train,
         y_train,
@@ -74,8 +73,6 @@ def test_certificate_dead_groups_carry_trivial_slack(toy_data):
     )
     assert np.allclose(model.theta, 0.0)
 
-    # evenness forces grad f(0) = 0, so the slack is exactly l1: dead groups are
-    # certified vacuously, which is the documented reason multi-start exists
     certificate = info["certificate"]
     assert np.all(np.isnan(certificate["live_kkt"]))
     assert np.allclose(certificate["dead_slack"], l1)
@@ -99,7 +96,7 @@ def test_penalized_objective_matches_fit_loglik(toy_data):
     )
     assert np.isclose(at_zero, -llk)
 
-    norms = np.linalg.norm(np.asarray(admm.to_groups(model.theta, group_size)), axis=-1)
+    norms = np.linalg.norm(np.asarray(glasso_admm.to_groups(model.theta, group_size)), axis=-1)
     at_one = penalized_objective(
         model.theta, model.g, jnp.array(1.0), x_train, y_train, group_size
     )

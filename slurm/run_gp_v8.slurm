@@ -41,9 +41,7 @@ echo "=========================================="
 
 # v8 is the first generation on the bounded x-update. Never submitted -- array 62588680 was
 # PENDING when the worktree it lived in was folded into main, and no results_v8 exists.
-# It needs vlse.lbfgsb importable (jaxvlse 0.1.0) or --solver lbfgsb raises on the first fit
 uv run python -u -m feetgp.run --output_dir /home/dsartor_umass_edu/feetgp/results_v8 \
-    --solver lbfgsb \
     --subsample 20 \
     --target $TARGET \
     --inclines all \

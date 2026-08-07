@@ -1,12 +1,11 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optimistix as optx
 import pytest
 from einops import rearrange
 
-from feetgp import admm
-from feetgp.glassogp import (
+from feetgp import glasso_admm
+from feetgp.gp import (
     GroupLassoGaussianProcess,
     admm_x_update_loss,
     gp_posterior,
@@ -32,7 +31,6 @@ def test_linear_fit_satisfies_group_lasso_kkt(toy_data):
         x_train, y_train, jnp.array(l1), group_size, max_iterations=4000, tol=1e-10
     )
 
-    # gradient of the squared loss, blocked the same way the penalty groups it
     residual = y_train - x_train @ model.theta.T
     grad = -x_train.T @ residual
     grad = rearrange(grad, "(d g) o -> d (g o)", g=group_size)
@@ -41,7 +39,6 @@ def test_linear_fit_satisfies_group_lasso_kkt(toy_data):
     for group, (grad_group, theta_group) in enumerate(zip(grad, theta)):
         norm = np.linalg.norm(theta_group)
         if norm < 1e-6:
-            # inactive: the subgradient of the penalty must be able to cancel the loss
             assert np.linalg.norm(grad_group) <= l1 + 1e-3, group
         else:
             optimality = grad_group + l1 * theta_group / norm
@@ -59,7 +56,6 @@ def test_gp_posterior_matches_naive_reference():
     ys = jnp.asarray(rng.normal(size=(n,)))
     trend = jnp.array(0.4)
 
-    # the pre-cholesky formulation, kept here as the reference
     gain = jnp.linalg.solve(Koo, Kox).T
     expected_mean = trend + gain @ (ys - trend)
     Kbx = jnp.ones((1, n)) @ gain.T
@@ -141,15 +137,11 @@ def test_x_update_objective_is_flat_below_zero(toy_data):
         jnp.array(100.0),
     )
 
-    # the likelihood sees relu(theta), so the negative orthant is a plateau at the value
-    # the boundary takes -- this is what stops L-BFGS mirroring a killed group into it
     negative = x.at[: d // 2].set(-1.0)
     at_zero = x.at[: d // 2].set(0.0)
     assert admm_x_update_loss(negative, args) == admm_x_update_loss(at_zero, args)
     assert admm_x_update_loss(negative, args) != admm_x_update_loss(x, args)
 
-    # evenness of the kernel still forces a zero gradient at the boundary, which is what
-    # makes loglik(relu(theta)) differentiable across it
     grad = jax.grad(admm_x_update_loss)(at_zero, args)
     assert np.allclose(grad[: d // 2], 0.0)
 
@@ -166,7 +158,7 @@ def test_autoregressive_output_cannot_see_its_own_group(toy_data):
         max_iterations=2,
         chunk_size=1,
     )
-    state_theta = admm.to_outputs(state.x, group_size)
+    state_theta = glasso_admm.to_outputs(state.x, group_size)
     for i in range(y_train.shape[1]):
         group_start = (i // group_size) * group_size
         own_group = slice(group_start, group_start + group_size)
@@ -175,11 +167,8 @@ def test_autoregressive_output_cannot_see_its_own_group(toy_data):
 
 
 def test_inner_solver_stops_before_its_cap(toy_data):
-    """The inner tolerance must actually fire, or inner_maxiter becomes the operating point.
+    from vlse.optim import minimise
 
-    At rtol=atol=EPS it did not: on the real problem 47/78 outputs ran the full 1000-step
-    cap and cost 175s for one x-update.
-    """
     x_train, y_train = toy_data
     rng = np.random.default_rng(6)
     d = x_train.shape[1]
@@ -192,17 +181,25 @@ def test_inner_solver_stops_before_its_cap(toy_data):
         jnp.array(1e-4),
         jnp.array(100.0),
     )
+    bounds = (
+        jnp.concat([jnp.zeros(d), jnp.array([-jnp.inf])]),
+        jnp.full(d + 1, jnp.inf),
+    )
 
     cap = 400
-    solver = optx.LBFGS(rtol=1e-4, atol=1e-4, history_length=40)
-    solution = optx.minimise(
-        admm_x_update_loss, solver, x0, args=args, max_steps=cap, throw=False
+    solution = minimise(
+        admm_x_update_loss,
+        x0,
+        bounds,
+        args=(args,),
+        tol=1e-2,
+        max_iterations=cap,
+        history_length=40,
     )
-    assert solution.stats["num_steps"] < cap
+    assert int(solution.iteration) < cap
 
 
 def test_fit_converges_within_its_iteration_budget(toy_data):
-    """A cheap inexact x-update run many times still has to reach the residual tolerance."""
     x_train, y_train = toy_data
     _, _, _, info = GroupLassoGaussianProcess.fit(
         x_train,

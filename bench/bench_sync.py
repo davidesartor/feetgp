@@ -1,14 +1,8 @@
-"""How fast is one batched x-update on this device, and how far does chunk_size pay?
-
-Scratch diagnostic, not part of the pipeline. Run it on the same devices the real
-jobs use; the x-update is essentially the whole cost of an ADMM iteration.
-"""
 
 import argparse
 import functools
 import time
 
-# a job that hits its walltime should still show the rows it did finish
 print = functools.partial(print, flush=True)
 
 import jax
@@ -17,9 +11,9 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from feetgp import admm
-from feetgp.admm import ADMMState
-from feetgp.glassogp import (
+from feetgp import glasso_admm
+from feetgp.glasso_admm import ADMMState
+from feetgp.gp import (
     admm_x_update_loss,
     autoregressive_mask,
     hetgpy_auto_bounds,
@@ -63,17 +57,12 @@ def best_of(fn, reps: int = 3) -> float:
     return min(times)
 
 
-############################################################
-# Build the state fit() would, at the [theta, w] layout
-############################################################
 g_min, g_max = jnp.array(1e-4), jnp.array(100.0)
 lower, upper = hetgpy_auto_bounds(x_train)
-theta_max = admm.to_groups(jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d)), group_size)
-theta_init = admm.to_groups(
+theta_max = glasso_admm.to_groups(jnp.broadcast_to(jnp.sqrt(2.0 / lower), (o, d)), group_size)
+theta_init = glasso_admm.to_groups(
     jnp.broadcast_to(jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), (o, d)), group_size
 )
-# w is not in the consensus at all: it rides in aux, and the nugget saturates into
-# [g_min, g_max], so only theta needs a box; see glassogp.fit
 bounds = jnp.stack([jnp.zeros_like(theta_max), theta_max])
 w_init = jnp.full((o,), w_from_nugget(jnp.array(0.1), g_min, g_max))
 state = ADMMState.initialize(theta_init, aux=w_init)
@@ -90,15 +79,11 @@ else:
     mask = None
 
 
-############################################################
-# One objective evaluation: the floor no solver step can beat
-############################################################
 def as_outputs(state: ADMMState) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """(x with the w column appended, the x-update target), both per output."""
     x = jnp.concat(
-        [admm.to_outputs(state.x, group_size), state.aux[..., None]], axis=-1
+        [glasso_admm.to_outputs(state.x, group_size), state.aux[..., None]], axis=-1
     )
-    return x, admm.to_outputs(state.z - state.u, group_size)
+    return x, glasso_admm.to_outputs(state.z - state.u, group_size)
 
 
 x0, target = as_outputs(state)
@@ -109,10 +94,6 @@ one_eval = best_of(
 print()
 print(f"one objective eval  {one_eval * 1000:9.2f} ms")
 
-############################################################
-# A whole x-update at each chunk size
-############################################################
-# one ADMM cycle up front, so every timed row starts from the same realistic z and u
 solution = x_update_solve(
     x0,
     target,
@@ -126,8 +107,8 @@ solution = x_update_solve(
     maxiter=args.maxiter,
     chunk_size=1,
 )
-theta = jnp.clip(admm.to_groups(solution[:, :-1], group_size), *bounds)
-warm = admm.z_and_u_update(
+theta = jnp.clip(glasso_admm.to_groups(solution[:, :-1], group_size), *bounds)
+warm = glasso_admm.z_and_u_update(
     state._replace(x=theta, aux=solution[:, -1]), l1, bounds=bounds
 )
 warm_x0, warm_target = as_outputs(warm)
@@ -160,7 +141,7 @@ for history in args.history:
                 ),
                 reps=3,
             )
-        except Exception as err:  # out of memory at this chunk size
+        except Exception as err:
             print(f"{chunk:>7}   {type(err).__name__}")
             break
         baseline = wall if baseline is None else baseline

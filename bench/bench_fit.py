@@ -1,15 +1,8 @@
-"""How long is one ADMM fit at a single lambda, and what does chunk_size buy?
-
-Scratch diagnostic, not part of the pipeline. Run it on the devices the real jobs use.
-The inner L-BFGS budget ramps, so per-iteration cost is not flat; the total is what
-multiplies out over a lambda sweep.
-"""
 
 import argparse
 import functools
 import time
 
-# a job that hits its walltime should still show the rows it did finish
 print = functools.partial(print, flush=True)
 
 import jax
@@ -18,7 +11,7 @@ from einops import rearrange
 
 jax.config.update("jax_enable_x64", True)
 
-from feetgp.glassogp import GroupLassoGaussianProcess, hetgpy_auto_bounds
+from feetgp.gp import GroupLassoGaussianProcess, hetgpy_auto_bounds
 from feetgp.inclinerunning import InclineRunning
 
 parser = argparse.ArgumentParser()
@@ -27,16 +20,13 @@ parser.add_argument("--feet", type=str, default="both")
 parser.add_argument("--ungroup_feet", action="store_true", default=False)
 parser.add_argument("--target", type=str, default="markers")
 parser.add_argument("--l1_penalty", type=float, default=0.0)
-# one row per budget, so a job that hits its walltime still shows the cost curve
 parser.add_argument("--maxiters", type=int, nargs="+", default=[5, 10, 20, 40, 80])
 parser.add_argument("--tol", type=float, default=1e-3)
 parser.add_argument("--chunks", type=int, nargs="+", default=[8, 32])
-parser.add_argument("--inner_maxiter", type=int, default=50)
-parser.add_argument("--inner_tol", type=float, default=1e-4)
+parser.add_argument("--inner_maxiter", type=int, default=5)
+parser.add_argument("--inner_tol", type=float, default=1e-2)
 parser.add_argument("--history_length", type=int, default=40)
-parser.add_argument("--alpha", type=float, default=1.0)
 parser.add_argument("--theta_scale", type=float, default=1.0)
-# fraction of the run after which rho stops adapting; 0.5 is what fit() defaults to
 parser.add_argument("--adapt_rho_frac", type=float, default=0.5)
 parser.add_argument("--log_every", type=int, default=0)
 args = parser.parse_args()
@@ -56,13 +46,9 @@ print(
     f" lambda={args.l1_penalty:g} tol={args.tol:g}"
 )
 
-# shared across every row, so no row pays the n*n cdist
 auto_bounds = hetgpy_auto_bounds(x_train)
-# widen the theta box by theta_scale: theta_max = sqrt(2 / lower)
 auto_bounds = (auto_bounds[0] / args.theta_scale**2, auto_bounds[1])
 
-# each row continues the previous row's ADMM state rather than refitting, so the rows
-# are a convergence curve of one fit and the last row's wall is the real cost of it
 total_iterations = max(args.maxiters)
 for chunk in args.chunks:
     if chunk > o:
@@ -70,7 +56,7 @@ for chunk in args.chunks:
     print()
     print(
         f"chunk_size={chunk} inner_maxiter={args.inner_maxiter} "
-        f"inner_tol={args.inner_tol} alpha={args.alpha}"
+        f"inner_tol={args.inner_tol}"
         f" theta_scale={args.theta_scale}"
     )
     print(
@@ -89,16 +75,13 @@ for chunk in args.chunks:
             auto_bounds=auto_bounds,
             warmstart=warmstart,
             max_iterations=maxiter - previous_iters,
-            # keep the rho freeze at the same absolute iteration the whole run would use
             adapt_rho_iters=max(
                 int(total_iterations * args.adapt_rho_frac) - previous_iters, 0
             ),
             tol=jnp.array(args.tol),
             chunk_size=chunk,
             inner_maxiter=args.inner_maxiter,
-            alpha=args.alpha,
-            inner_rtol=args.inner_tol,
-            inner_atol=args.inner_tol,
+            inner_pgtol=args.inner_tol,
             history_length=args.history_length,
             log_every=args.log_every,
         )
@@ -106,7 +89,6 @@ for chunk in args.chunks:
         cumulative += time.perf_counter() - start
         groups = rearrange(model.theta, "o (d g) -> d (o g)", g=group_size)
         n_active = int(jnp.sum(jnp.linalg.norm(groups, axis=-1) > 1e-8))
-        # how much of the primal residual is x sitting outside the theta box
         theta_max = jnp.sqrt(2.0 / auto_bounds[0])
         over = jnp.abs(state.x[:, :-1]) > theta_max
         r_box = float(

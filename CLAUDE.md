@@ -22,16 +22,16 @@ The **mathematical** facts below (evenness, absorbing death, box dynamics) are d
 
 The chosen restructure (over a direct penalized solve or greedy backward elimination, both deferred): keep the ADMM machinery, race multiple starts per λ, certify post hoc.
 
-- **Multi-start per λ** (`--n_starts`, default 3; `run.py: fit_multistart`). Each λ races the chained warmstart against the dense λ=0 start (rho reset to 1.0) and log-uniform random draws from the hetgpy band; the winner is chosen by `glassogp.penalized_objective`, the true nonsmooth objective. This is the structural fix for continuation bias: death is absorbing, so the chained start can only lose groups, and the dense start is what can win them back (`tests/test_multistart.py` proves a resurrection). The winner-start histogram in `summarize_runs` is the continuation-bias meter. `--n_starts 1` restores single-start; the linear model is convex and always runs one start.
-- **`kkt_certificate` replaces trust in `converged`** (which was measured grazing its tolerance at 0.999x). Every GP fit stores in `info["certificate"]`: box-projected stationarity per live group, subgradient slack per dead group (trivially λ — evenness makes dead-group certification vacuous; multi-start is the compensation), and the nugget gradient in `w`. `plots.py` crosses out λ by certificate failure (falling back to `converged` for old pickles); `summarize_runs.py` reports the `max_live_kkt` distribution against `glassogp.CERTIFICATE_TOLERANCE` — a provisional threshold, recalibrate once a real path is measured.
+- **Multi-start per λ** (`--n_starts`, default 3; `run.py: fit_multistart`). Each λ races the chained warmstart against the dense λ=0 start (rho reset to 1.0) and log-uniform random draws from the hetgpy band; the winner is chosen by `gp.penalized_objective`, the true nonsmooth objective. This is the structural fix for continuation bias: death is absorbing, so the chained start can only lose groups, and the dense start is what can win them back (`tests/test_multistart.py` proves a resurrection). The winner-start histogram in `summarize_runs` is the continuation-bias meter. `--n_starts 1` restores single-start; the linear model is convex and always runs one start.
+- **`kkt_certificate` replaces trust in `converged`** (which was measured grazing its tolerance at 0.999x). Every GP fit stores in `info["certificate"]`: box-projected stationarity per live group, subgradient slack per dead group (trivially λ — evenness makes dead-group certification vacuous; multi-start is the compensation), and the nugget gradient in `w`. `plots.py` crosses out λ by certificate failure (falling back to `converged` for old pickles); `summarize_runs.py` reports the `max_live_kkt` distribution against `gp.CERTIFICATE_TOLERANCE` — a provisional threshold, recalibrate once a real path is measured.
 - **Provenance**: `meta.json` records `git_dirty`; `run.py` warns loudly on a dirty tree. Commit before submitting, always.
-- **`jaxvlse` 0.1.1** is the fast bounded solver behind `--solver lbfgsb` (`from vlse.optim import minimise`, jit/vmap/`lax.map` compatible). The 67.4 s vs 488.7 s comparison against optimistix is one knot, not a path — `slurm/run_gp_ab.slurm` is the A/B that decides whether the default flips.
+- **`jaxvlse` 0.1.1 is the only inner solver.** The optimistix path (unconstrained L-BFGS plus projection) was removed 2026-08-07 by user decision on the one-knot evidence — the planned path-level A/B never ran, so certificate quality on full lbfgsb paths is unmeasured. If certificates fail systematically on the first real generation, suspect the inner budget before the algorithm.
 - **Still restructure material**: the λ-grid walk and rho adaptation are unchanged grid-builders; multi-start makes their biases detected rather than assumed away, but the rho/λ entanglement (see above) stands. Batching restarts through `vlse` vmap (instead of sequential fits) is the known next optimization.
 
 ## Layout
 
 ```
-src/feetgp/        the library: admm.py, glassogp.py, linear.py, inclinerunning.py
+src/feetgp/        the library: glasso_admm.py, gp.py, linear.py, inclinerunning.py
                    the entry points: run.py, plots.py, summarize_runs.py
 bench/             one-off diagnostics: uv run python -m bench.bench_knot
 slurm/             batch scripts, submitted from the repo root: sbatch slurm/run_gp_v7.slurm
@@ -47,13 +47,10 @@ src layout: `import feetgp` resolves to the installed package, never the cwd. En
 ```bash
 # single run (GP model, marker targets, both feet)
 uv run python -m feetgp.run --subsample 20 --target markers --feet both \
-    --chunk_size 39 --maxiter 300 --inner_maxiter 50 --inner_tol 1e-4
+    --chunk_size 39 --maxiter 300
 
 # linear ablation instead of GP
 uv run python -m feetgp.run --linear_model --subsample 20 --tol 1e-6
-
-# fast bounded solver
-uv run python -m feetgp.run --solver lbfgsb ...
 
 # render plotly HTML for every finished run under results/
 uv run python -m feetgp.plots --results_dir results
@@ -76,7 +73,7 @@ No linter config in the repo.
 
 Each pickle carries the full `admm_state`, so a resume warmstarts the dual variable and rho, not just parameters. **A warmstart carries pathology across generations** — seeding v7 from v6's frozen pickles reproduced the freeze exactly — so a code fix needs a fresh grid, not a resumed one.
 
-Pickles are versioned by `STATE_FORMAT` in `run.py` (currently 5: shared ADMM machinery, `(groups, members)` layout, nugget in `aux`). Format 4 is losslessly converted (`admm_state_from_legacy`); older formats load as results but are refused as warmstarts — reading one format's `w` as another's is a wrong-nugget bug that leaves no trace. Bump `STATE_FORMAT` whenever the parametrization moves; convert instead of refusing only when provably lossless. The field-only `GLASSOADMMState` stubs in `glassogp.py`/`linear.py` exist so a stray format-4 pickle (none survive in this repo) stays unpicklable-by-name; keep them.
+Pickles are versioned by `STATE_FORMAT` in `run.py` (currently 5: shared ADMM machinery, `(groups, members)` layout, nugget in `aux`). Format 4 is losslessly converted (`admm_state_from_legacy`); older formats load as results but are refused as warmstarts — reading one format's `w` as another's is a wrong-nugget bug that leaves no trace. Bump `STATE_FORMAT` whenever the parametrization moves; convert instead of refusing only when provably lossless. The field-only `GLASSOADMMState` stubs in `gp.py`/`linear.py` exist so a stray format-4 pickle (none survive in this repo) stays unpicklable-by-name; keep them.
 
 `run.py` writes `meta.json` per run dir (argv, `group_size`, columns, `group_labels`, git revision). New labelling work belongs there, not in the path parser (`labels_from_run_dir` is fallback only).
 
@@ -86,36 +83,36 @@ The GP objective is **exactly even in `theta`**: the kernel sees only `theta**2`
 
 - **`theta = 0` satisfies group-lasso stationarity at every λ > 0** (`‖∇_g f‖ = 0 ≤ λ`). The all-dead point is always a local minimum, the problem is nonconvex, and which solution a single-start ADMM finds is decided by the warmstart. Any single-start path is a continuation path, not a global-optimum path.
 - **Death is absorbing** (under the box). Once a group has `x = z = 0`, `u` stops moving, the x-update target `z - u = -u` is nonpositive and clips back to zero, and no term can resurrect it. Hence the current sweep's hard rule: never hand a fit a warmstart sparser than its own solution — walking λ downward chained onto sparser neighbours produced whole paths at 0 active. Multi-start (`--n_starts`) is the structural fix — the dense start competes at every λ — and the rule survives only as the heuristic that makes the chained start usually good.
-- **`theta >= 0` is load-bearing dynamically, free statistically.** Unconstrained, a dead group's fixed point requires `u = 0` exactly (measure zero) and ADMM limit-cycles between the two mirror wells instead. With the box, the x-update clips to exactly zero and stationarity relaxes to the inequality `u >= 0`, satisfied by a whole set. The box must hold on **both** `x` and `z` (the optimistix path projects after solving; the lbfgsb path has it as the feasible set).
+- **`theta >= 0` is load-bearing dynamically, free statistically.** Unconstrained, a dead group's fixed point requires `u = 0` exactly (measure zero) and ADMM limit-cycles between the two mirror wells instead. With the box, the x-update clips to exactly zero and stationarity relaxes to the inequality `u >= 0`, satisfied by a whole set. The box must hold on **both** `x` and `z` (the inner L-BFGS-B has it as its feasible set; `z` gets it from the prox and the clip in the x-update handoff).
 - **The mirror well is killed by `relu` in the likelihood, not by steering rho.** At a fixed point the x-update target is `z_g (1 - l1/(rho‖z_g‖))`, which goes negative as a group approaches death; on an even objective that makes the reflected well the deeper one. `admm_x_update_loss` feeds `jax.nn.relu(theta)` to the kernel — the negative orthant becomes a likelihood plateau (C1 across the boundary, since evenness forces zero gradient there; `test_x_update_objective_is_flat_below_zero`) — while the augmented term keeps **raw** `theta` so a stray negative coordinate is still pulled back. If the relu ever saw the augmented term too, the orthant would be entirely flat and nothing could escape it. **Do not reintroduce a rho floor**: `rho_floor` held every group a fixed factor from its own death threshold and froze whole paths at full support. It conflated a global pathology (all targets negative at once) with the legitimate death of one marginal group.
 - **Sparsity lives in `z`, not `x`.** `z` is the prox output and is exactly zero by construction; `fit` reports `state.z`. Do not read `state.x` for `n_active`.
-- **The nugget saturates, it is not clipped.** `g = g_min + (g_max - g_min)·sigmoid(w)`, `w` unbounded, riding in `ADMMState.aux` where `admm.py` never touches it — structurally outside the consensus constraint and both residuals. It was once a clipped column of `x`, and any output noisier than the ceiling then held the primal residual above tol at *every* λ. Do not bound `w`; do not move it out of `aux`. The `g_range` floor (1e-4) is load-bearing: without it the marginal likelihood runs away to interpolation as `g → 0`. `nugget_from_w`/`w_from_nugget` are the only conversion sites.
-- **GP runs plain ADMM, `alpha = 1.0`.** Over-relaxation's `x_hat = alpha·x + (1-alpha)·z` leaves the box whenever `x` and `z` straddle (feeding `u` the overshoot, reopening the mirror well), and at λ=0 — where the prox is the identity — it turns the primal residual into a noise meter for the x-update's jitter (`r = (alpha-1)‖x - z_prev‖`) with a floor no budget crosses. `linear.py` keeps `alpha=1.6`: no box, objective not even.
+- **The nugget saturates, it is not clipped.** `g = g_min + (g_max - g_min)·sigmoid(w)`, `w` unbounded, riding in `ADMMState.aux` where `glasso_admm.py` never touches it — structurally outside the consensus constraint and both residuals. It was once a clipped column of `x`, and any output noisier than the ceiling then held the primal residual above tol at *every* λ. Do not bound `w`; do not move it out of `aux`. The `g_range` floor (1e-4) is load-bearing: without it the marginal likelihood runs away to interpolation as `g → 0`. `nugget_from_w`/`w_from_nugget` are the only conversion sites.
+- **Over-relaxation is gone entirely** (removed 2026-08-07). `x_hat = alpha·x + (1-alpha)·z` leaves the box whenever `x` and `z` straddle (feeding `u` the overshoot, reopening the mirror well), and at λ=0 — where the prox is the identity — it turns the primal residual into a noise meter for the x-update's jitter (`r = (alpha-1)‖x - z_prev‖`) with a floor no budget crosses. `linear.py` used to run `alpha=1.6` legitimately (no box, convex) and now runs plain ADMM too — pure speed loss there, accepted to keep `glasso_admm.py` single-path.
 - **rho is reset at the λ=0 handoff, not gated in `check_residuals`.** At λ=0 the prox is the identity, `u ≡ 0`, the primal residual is identically zero, and `dual > 10·primal` fires every iteration — rho decaying toward `RHO_MIN` is *locally correct* (it makes the x-update the exact MLE λ=0 wants, and it is the only way λ=0's dual test can pass at all). The damage is only at the handoff — a warmstart at rho≈1e-6 has a prox threshold that kills every group on contact — so `run.py` does `states[0.0]._replace(rho=jnp.array(1.0))`. Gating the adaptation on residuals clearing `eps_abs` instead was tried and burns the whole budget at λ=0.
 - **`eps_abs = sqrt(p)·EPS`, not `EPS`** (Boyd §3.3.1): both residuals are norms of p-element vectors, and at λ=0 the dual criterion has no relative term left, so an unscaled floor asks the inexact x-update for a residual below its own noise.
 - **rho adaptation is clamped to `[RHO_MIN, RHO_MAX]` and frozen after `adapt_rho_iters`** (`None` → `max_iterations // 2` — keep that coupling; otherwise retuning the budget silently moves the freeze point). Unclamped, an irreducible primal floor feeds the ×2 rule to rho ~1e22, where the augmented term swamps float64. `u` is rescaled by the applied ratio, not by `scale`. But note the skepticism section: even clamped, rho tracking λ is what made part of the λ axis illusory — the adaptation rule itself is restructure material.
 
 ## ADMM structure (both models)
 
-`admm.py` owns the algorithm; `glassogp.py`/`linear.py` own only their x-update, passed to `admm.solve` as a closure `(state, iteration) -> (state, exact)`.
+`glasso_admm.py` owns the algorithm; `gp.py`/`linear.py` own only their x-update, passed to `glasso_admm.solve` as a closure `(state, iteration) -> (state, exact)`.
 
-- **Layout convention `(... g)`**: leading axes index groups, last axis holds one group's members. That removes `group_size` from `admm.py` entirely — the prox is a norm over the last axis. Models convert with `admm.to_groups`/`to_outputs` (`rearrange(v, "o (d g) -> d (o g)", g=group_size)`), pooling one marker across every output and coordinate.
-- **`ADMMState.aux`** carries parameters the x-update owns but the consensus must not see (the GP nugget `w`). `admm.py` threads it through untouched.
+- **Layout convention `(... g)`**: leading axes index groups, last axis holds one group's members. That removes `group_size` from `glasso_admm.py` entirely — the prox is a norm over the last axis. Models convert with `glasso_admm.to_groups`/`to_outputs` (`rearrange(v, "o (d g) -> d (o g)", g=group_size)`), pooling one marker across every output and coordinate.
+- **`ADMMState.aux`** carries parameters the x-update owns but the consensus must not see (the GP nugget `w`). `glasso_admm.py` threads it through untouched.
 - **The x-update reports whether it was exact**; `solve` suppresses the convergence break otherwise, so a cheap early iteration under the ramping inner budget (`inner_maxiter_init · 2**iter` up to the cap) cannot fake convergence.
 - **`bounds` are a `solve` argument, not state** — always rederived from data, nothing to strip before pickling.
 - x-update: linear = closed-form ridge (always exact). GP = per-output L-BFGS over `jax.lax.map(..., batch_size=chunk_size)` — a chunked vmap; a `lax.while_loop` under vmap cannot exit per element, so a chunk costs the max over its members. Prefer `chunk_size` a divisor of the output count (78 = 2×39).
 - `GroupLassoGaussianProcess.fit` returns `(model, loglik, admm_state, info)`; linear returns `(model, loss, admm_state, info)`. `info` (`converged`, `iterations`, residuals) goes in the pickle and drives `plots.py`'s crossed-out unconverged λ — bookkeeping lives there, not in `ADMMState`. Both models expose `theta`, `predict`, and a `warmstart=` kwarg so `run.py` treats them interchangeably.
 - Prediction and `unpack_parameters` use `lax.scan` over outputs, not vmap — one n×n kernel live at a time, deliberate OOM avoidance. `predict` skips `Kxx` unless `covariance=True`.
 
-## The two inner solvers (`--solver`)
+## The inner solver (vlse L-BFGS-B)
 
-`optimistix` (default) is unconstrained L-BFGS plus projection onto the box; `lbfgsb` is vlse's bounded solver, box as feasible set. **No budget or tolerance transfers between them:**
+The GP x-update runs vlse's bounded L-BFGS-B (`from vlse.optim import minimise`, jaxvlse ≥0.1.1), box as feasible set. The optimistix projection path was removed 2026-08-07 on the one-knot 67.4 s vs 488.7 s measurement plus user decision — no path-level A/B ever ran, which is why the certificate machinery matters. Budgets and tolerances are lbfgsb-native and **do not transfer from any optimistix-era number**:
 
-- `inner_maxiter`: optimistix counts single steps, lbfgsb whole line searches — unset resolves to 50 vs 5.
-- `inner_tol`: optimistix stops on a *step* criterion (loose), lbfgsb on the projected-gradient infinity norm (scipy's `pgtol`, tight) — unset resolves to 1e-4 vs 1e-2.
-- `--inner_max_linesearch` (lbfgsb only, default 5) is the straggler's leash under `lax.map`.
-- The ramp's first rung `inner_maxiter_init` is 1 for lbfgsb vs 20 for optimistix — a shared 20 would sit above lbfgsb's cap from iteration 0, leaving the ramp inert and stamping every x-update `exact=True`.
-- lbfgsb's `solver_bounds` are the `[0, theta_max]` box in output layout with a `±inf` column appended for `w` (which must stay unbounded — it saturates).
+- `inner_maxiter` (default 5) counts whole line searches, not steps — 5 is not small.
+- `inner_tol` (default 1e-2) is the projected-gradient infinity norm (scipy's `pgtol`), far tighter than a step criterion of the same magnitude.
+- `--inner_max_linesearch` (default 5) is the straggler's leash under `lax.map`.
+- The ramp's first rung `inner_maxiter_init` is 1 and must sit below `inner_maxiter`, or the ramp is inert and every x-update stamps `exact=True`, letting the convergence break fire immediately.
+- `solver_bounds` are the `[0, theta_max]` box in output layout with a `±inf` column appended for `w` (which must stay unbounded — it saturates).
 
 The inner budget is the dominant cost lever (`iterations × outputs × inner_steps`); the device is compute-bound (one n×n float64 Cholesky saturates an A100), so `chunk_size` barely matters and batching over *starts* — not outputs — is where the GPU wins.
 

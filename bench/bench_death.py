@@ -1,8 +1,3 @@
-"""Can a group reach exactly zero at high lambda, or does the path only shrink?
-
-Chains fits upward from a cached state exactly as the sweep does, and reports the
-active-group count and the two smallest group norms at each step.
-"""
 
 import argparse
 import glob
@@ -29,7 +24,6 @@ from feetgp.inclinerunning import InclineRunning
 
 
 def nearest_cached(run_dir: str, l1: float) -> tuple[str, float]:
-    """Closest cached lambda to the one asked for, so a bench never dies on a typo."""
     paths = glob.glob(f"{run_dir}/lambda=*.pkl")
     parsed = [
         (float(m.group(1)), p)

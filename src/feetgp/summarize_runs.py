@@ -1,4 +1,3 @@
-"""One line per run dir: path shape, R2 range, convergence, so results can be deleted."""
 
 import glob
 import json
@@ -9,7 +8,7 @@ import sys
 
 import numpy as np
 
-from feetgp.glassogp import CERTIFICATE_TOLERANCE
+from feetgp.gp import CERTIFICATE_TOLERANCE
 
 
 def read_run(run_dir):
@@ -71,8 +70,6 @@ def summarize(run_dir):
         smallest_support_usable=min((row["active"] for row in usable), default=None),
         unconverged=sum(1 for row in have_info if not row["converged"]),
         n_with_info=len(have_info),
-        # certificate distribution, and the winner histogram: how often the chained
-        # start lost is the continuation-bias meter
         kkt_median=float(np.median(kkt)) if kkt else None,
         kkt_max=float(np.max(kkt)) if kkt else None,
         kkt_failures=sum(1 for value in kkt if value > CERTIFICATE_TOLERANCE),

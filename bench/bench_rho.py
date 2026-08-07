@@ -1,10 +1,3 @@
-"""Does the prox threshold drift off the group-norm scale as lambda walks up?
-
-Reads the cached ADMM states of a finished run and prints, per lambda, the quantity the
-prox actually thresholds on: l1 / (rho * ||(x+u)_group||). A group dies when that reaches
-1. If rho stays put while lambda climbs, the threshold climbs with it and death has to be
-driven entirely by an inflating u -- which is the slow, residual-floored regime.
-"""
 
 import argparse
 import pickle
@@ -13,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from feetgp.glassogp import admm_state_from_pickle
+from feetgp.gp import admm_state_from_pickle
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_dir", type=str, required=True)

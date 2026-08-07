@@ -22,7 +22,7 @@ for frac in 0.5 1.0; do
     uv run python -u -m bench.bench_fit \
         --subsample 20 --feet both --target markers --l1_penalty 0.0 \
         --maxiters 50 100 200 300 --chunks 39 \
-        --inner_maxiter 20 --inner_tol 1e-4 --alpha 1.0 \
+        --inner_maxiter 5 --inner_tol 1e-2 \
         --adapt_rho_frac "${frac}" --log_every 25
 done
 

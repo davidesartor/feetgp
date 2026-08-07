@@ -3,15 +3,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from feetgp import admm
-from feetgp.glassogp import GroupLassoGaussianProcess, penalized_objective
+from feetgp import glasso_admm
+from feetgp.gp import GroupLassoGaussianProcess, penalized_objective
 
 jax.config.update("jax_enable_x64", True)
 
 
 @pytest.fixture
 def signal_data():
-    """Group 0 (columns 0-2) carries the signal, group 1 is pure noise."""
     rng = np.random.default_rng(1)
     x = rng.uniform(size=(40, 6))
     signal = np.sin(4.0 * x[:, 0]) + x[:, 1]
@@ -20,12 +19,6 @@ def signal_data():
 
 
 def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
-    """Continuation bias is corrected by ranking starts on the true objective.
-
-    Death is absorbing: a warmstart with the signal group forced dead keeps it dead,
-    so the chained start alone can never win it back. The dense start can, and the
-    penalized objective ranks it above the biased solution.
-    """
     x_train, y_train = signal_data
     group_size, l1 = 3, 0.3
 
@@ -39,12 +32,10 @@ def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
         chunk_size=2,
     )
     dense_norms = np.linalg.norm(
-        np.asarray(admm.to_groups(dense_model.theta, group_size)), axis=-1
+        np.asarray(glasso_admm.to_groups(dense_model.theta, group_size)), axis=-1
     )
     assert dense_norms[0] > 1e-3, dense_norms
 
-    # forcing x = z = u = 0 on the signal group reproduces what a sparser-than-true
-    # chained warmstart hands the next lambda
     dead_state = dense_state._replace(
         x=dense_state.x.at[0].set(0.0),
         z=dense_state.z.at[0].set(0.0),
@@ -61,7 +52,7 @@ def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
         chunk_size=2,
     )
     sparse_norms = np.linalg.norm(
-        np.asarray(admm.to_groups(sparse_model.theta, group_size)), axis=-1
+        np.asarray(glasso_admm.to_groups(sparse_model.theta, group_size)), axis=-1
     )
     assert sparse_norms[0] < 1e-8, sparse_norms
 
