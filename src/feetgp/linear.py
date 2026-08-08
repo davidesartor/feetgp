@@ -6,7 +6,7 @@ import equinox as eqx
 
 from einops import rearrange, einsum
 
-from feetgp.glasso_admm import ADMMState, solve
+from feetgp.glasso_admm import ADMMState, kkt_certificate, solve
 
 
 class GroupLassoLinear(NamedTuple):
@@ -28,7 +28,7 @@ class GroupLassoLinear(NamedTuple):
         *,
         fit_intercept: bool = True,
         **kwargs,
-    ) -> tuple[Self, Float[Array, ""], Bool[Array, ""], Int[Array, ""]]:
+    ) -> tuple[Self, Float[Array, ""], Bool[Array, ""], Int[Array, ""], dict]:
         _, d, g = x_train.shape
         _, o = y_train.shape
 
@@ -60,4 +60,11 @@ class GroupLassoLinear(NamedTuple):
         bias = y_mean - einsum(theta, x_mean, "o d g, d g -> o")
         model = cls(theta=theta, bias=bias, x_train=x_train, y_train=y_train)
         loss = 0.5 * jnp.sum((y_train - model.predict(x_train)) ** 2)
-        return model, loss, converged, iterations
+
+        # optimality certificate from the closed form gradient
+        theta_flat = rearrange(state.z, "(o g) d -> (d g) o", g=g)
+        grad = rearrange(A0 @ theta_flat - b0, "(d g) o -> (o g) d", g=g)
+        certificate = kkt_certificate(
+            grad, state.z, kwargs.get("l1_penalty", jnp.array(0.0))
+        )
+        return model, loss, converged, iterations, certificate

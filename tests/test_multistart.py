@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from einops import rearrange
 
-from feetgp.gp import GroupLassoGaussianProcess, penalized_objective
+from feetgp.gp import GroupLassoGaussianProcess
 
 jax.config.update("jax_enable_x64", True)
 
@@ -28,7 +28,7 @@ def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
     x_train, y_train = signal_data
     l1 = 0.3
 
-    dense_model, _, dense_state, _ = GroupLassoGaussianProcess.fit(
+    dense_model, dense_llk, dense_state, _ = GroupLassoGaussianProcess.fit(
         x_train,
         y_train,
         l1_penalty=jnp.array(l1),
@@ -44,7 +44,7 @@ def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
         z=dense_state.z.at[..., 0].set(0.0),
         u=dense_state.u.at[..., 0].set(0.0),
     )
-    sparse_model, _, _, _ = GroupLassoGaussianProcess.fit(
+    sparse_model, sparse_llk, _, _ = GroupLassoGaussianProcess.fit(
         x_train,
         y_train,
         l1_penalty=jnp.array(l1),
@@ -56,9 +56,7 @@ def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
     sparse_norms = group_norms(sparse_model)
     assert sparse_norms[0] < 1e-8, sparse_norms
 
-    def objective(model):
-        return float(
-            penalized_objective(model.theta, model.g, jnp.array(l1), x_train, y_train)
-        )
+    def objective(model, llk):
+        return float(-llk + l1 * group_norms(model).sum())
 
-    assert objective(dense_model) < objective(sparse_model)
+    assert objective(dense_model, dense_llk) < objective(sparse_model, sparse_llk)

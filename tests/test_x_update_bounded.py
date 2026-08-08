@@ -5,7 +5,7 @@ import pytest
 from scipy.optimize import Bounds
 from scipy.optimize import minimize as scipy_minimize
 
-from feetgp.gp import nugget_from_w, x_update_loss
+from feetgp.gp import x_update_loss
 
 minimise = pytest.importorskip("vlse.optim", reason="jaxvlse is not installed").minimise
 
@@ -40,11 +40,11 @@ def test_gp_x_update_matches_scipy():
     x_train = jnp.asarray(rng.uniform(size=(n, d)))
     y_train = jnp.asarray(rng.normal(size=n))
     target = jnp.asarray(rng.uniform(0.2, 1.5, size=d))
-    args = (target, jnp.array(1.0), x_train, y_train, jnp.array(1e-4), jnp.array(100.0))
+    args = (target, jnp.array(1.0), x_train, y_train)
 
     x0 = jnp.concatenate([jnp.ones(d), jnp.zeros(1)])
-    lower = jnp.concatenate([jnp.zeros(d), jnp.array([-jnp.inf])])
-    upper = jnp.concatenate([jnp.full(d, 3.0), jnp.array([jnp.inf])])
+    lower = jnp.concatenate([jnp.zeros(d), jnp.array([jnp.log(1e-4)])])
+    upper = jnp.concatenate([jnp.full(d, 3.0), jnp.array([jnp.log(100.0)])])
 
     state = minimise(
         x_update_loss,
@@ -60,5 +60,5 @@ def test_gp_x_update_matches_scipy():
 
     assert state.f <= f_scipy + 1e-8 * (1.0 + abs(f_scipy))
     assert np.allclose(state.x[:-1], x_scipy[:-1], atol=1e-5)
-    nugget = lambda w: nugget_from_w(w, args[-2], args[-1])
+    nugget = lambda w: jnp.exp(w)
     assert nugget(state.x[-1]) == pytest.approx(nugget(x_scipy[-1]), rel=1e-6)

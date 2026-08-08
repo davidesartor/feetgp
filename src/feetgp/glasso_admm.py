@@ -20,6 +20,38 @@ class ADMMState(NamedTuple):
 UpdateX = Callable[[ADMMState], ADMMState]
 
 
+def kkt_certificate(
+    grad: Float[Array, "... g"],
+    theta: Float[Array, "... g"],
+    l1: Float[Array, ""],
+    bounds: Optional[Float[Array, "2 ... g"]] = None,
+) -> dict:
+    """Check the group lasso KKT conditions given the smooth-loss gradient."""
+    # stationarity of live groups: gradient plus the penalty subgradient
+    norms = jnp.sqrt(reduce(theta**2, "... g -> g", "sum"))
+    live = norms > 0.0
+    stationarity = grad + l1 * theta / jnp.where(live, norms, 1.0)
+
+    # project out components blocked by the box constraints
+    if bounds is not None:
+        lower, upper = bounds
+        stationarity = jnp.where(
+            theta <= lower, jnp.minimum(stationarity, 0.0), stationarity
+        )
+        stationarity = jnp.where(
+            theta >= upper, jnp.maximum(stationarity, 0.0), stationarity
+        )
+
+    # dead groups only need their gradient inside the penalty ball
+    live_kkt = jnp.sqrt(reduce(stationarity**2, "... g -> g", "sum"))
+    dead_slack = l1 - jnp.sqrt(reduce(grad**2, "... g -> g", "sum"))
+    return dict(
+        max_live_kkt=jnp.max(jnp.where(live, live_kkt, 0.0)),
+        live_kkt=jnp.where(live, live_kkt, jnp.nan),
+        dead_slack=jnp.where(live, jnp.nan, dead_slack),
+    )
+
+
 @eqx.filter_jit
 def update_z_and_u(state: ADMMState, l1_penalty: Float[Array, ""]) -> ADMMState:
     # compute the group lasso proximal operator

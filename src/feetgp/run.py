@@ -15,7 +15,6 @@ from einops import rearrange
 from sklearn.metrics import r2_score
 
 from feetgp import glasso_admm
-from feetgp import gp
 from feetgp.gp import GroupLassoGaussianProcess, hetgpy_auto_bounds
 from feetgp.linear import GroupLassoLinear
 from feetgp.inclinerunning import InclineRunning
@@ -153,8 +152,6 @@ if __name__ == "__main__":
                 return path
         return None
 
-    auto_bounds = None if args.linear_model else hetgpy_auto_bounds(x_train)
-
     chunk_size = min(args.chunk_size, y_train.shape[1])
 
     def fit(l1_penalty: float, warmstart=None):
@@ -165,7 +162,6 @@ if __name__ == "__main__":
             l1_penalty=jnp.array(l1_penalty),
             autoregressive=autoregressive,
             warmstart=warmstart,
-            auto_bounds=auto_bounds,
             max_iterations=args.maxiter,
             tol=jnp.array(args.tol),
             adapt_rho_iters=args.adapt_rho_iters,
@@ -178,11 +174,13 @@ if __name__ == "__main__":
 
     def random_start(l1_penalty: float, k: int) -> glasso_admm.ADMMState:
         rng = np.random.default_rng([k, int(np.float64(l1_penalty).view(np.uint64))])
-        lower, upper = auto_bounds
-        low, high = np.sqrt(2.0 / upper), np.sqrt(2.0 / lower)
+        lower, upper = hetgpy_auto_bounds(rearrange(x_train, "n d g -> n (d g)"))
+        low, high = (
+            rearrange(np.sqrt(2.0 / bound), "(d g) -> d g", g=group_size)
+            for bound in (upper, lower)
+        )
         theta = np.exp(rng.uniform(np.log(low), np.log(high), size=(o, d, group_size)))
-        g_min, g_max = (jnp.array(g) for g in gp.G_RANGE)
-        w = gp.w_from_nugget(jnp.array(0.1), g_min, g_max)
+        w = jnp.log(0.1)
         x0 = rearrange(jnp.asarray(theta), "o d g -> o g d")
         return glasso_admm.ADMMState(
             x=x0,
@@ -214,11 +212,8 @@ if __name__ == "__main__":
         fits = {}
         for label, start in starts:
             model, llk, state, info = fit(l1_penalty, warmstart=start)
-            objective = float(
-                gp.penalized_objective(
-                    model.theta, model.g, jnp.asarray(l1_penalty), x_train, y_train
-                )
-            )
+            norms = jnp.linalg.norm(rearrange(model.theta, "o d g -> d (o g)"), axis=-1)
+            objective = float(-llk + l1_penalty * norms.sum())
             fits[label] = (objective, model, llk, state, info)
             print(
                 f"    start {label}: objective = {objective:.6f},"
@@ -251,7 +246,12 @@ if __name__ == "__main__":
         x: Float[Array, "m d"],
         y: Float[Array, "m o"],
     ) -> Float[Array, "o"]:
-        y_pred = np.array(model.predict(x))
+        if isinstance(model, GroupLassoLinear):
+            y_pred = np.array(model.predict(x))
+        else:
+            # mock query dim: per-point 1x1 covariance instead of full m x m
+            mean, _ = model.predict(x[:, None])
+            y_pred = np.array(rearrange(mean, "m o 1 -> o m"))
         r2 = jnp.array([r2_score(y[:, j], y_pred[j, :]) for j in range(o)])
         return r2
 

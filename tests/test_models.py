@@ -26,7 +26,7 @@ def toy_data():
 def test_linear_fit_satisfies_group_lasso_kkt(toy_data):
     x_train, y_train = toy_data
     l1 = 0.5
-    model, _, _, _ = GroupLassoLinear.fit(
+    model, _, _, _, _ = GroupLassoLinear.fit(
         x_train, y_train, l1_penalty=jnp.array(l1), max_iterations=4000, tol=1e-10
     )
 
@@ -74,30 +74,33 @@ def test_gp_predict_matches_per_output_posterior(toy_data):
     xs = jnp.asarray(rng.uniform(size=(5, d, g)))
     model = GroupLassoGaussianProcess(
         theta=jnp.asarray(rng.uniform(0.5, 2.0, size=(o, d, g))),
-        g=jnp.full((o,), 0.1),
+        nugget=jnp.full((o,), 0.1),
         b=jnp.asarray(rng.normal(size=(o,))),
         nu=jnp.full((o,), 1.3),
         x_train=x_train,
         y_train=y_train,
     )
 
-    mean = model.predict(xs)
+    mean, cov = model.predict(xs)
     assert mean.shape == (o, len(xs))
+    assert cov.shape == (o, len(xs), len(xs))
 
     design = rearrange(x_train, "n d g -> n (d g)")
     xs_flat = rearrange(xs, "m d g -> m (d g)")
     for i in range(o):
-        nu, gi = model.nu[i], model.g[i]
+        nu, gi = model.nu[i], model.nugget[i]
         theta_flat = rearrange(model.theta[i], "d g -> (d g)")
         Koo = nu * (kernel(theta_flat, design, design) + gi * jnp.eye(len(x_train)))
         Kox = nu * kernel(theta_flat, design, xs_flat)
         Kxx = nu * kernel(theta_flat, xs_flat, xs_flat)
-        expected, _ = gp_posterior(Kxx, Kox, Koo, y_train[:, i], model.b[i])
+        expected, expected_cov = gp_posterior(Kxx, Kox, Koo, y_train[:, i], model.b[i])
         assert np.allclose(mean[i], expected)
+        assert np.allclose(cov[i], expected_cov)
 
-    mean_with_cov, cov = model.predict(xs, covariance=True)
-    assert cov.shape == (o, len(xs), len(xs))
-    assert np.allclose(mean_with_cov, mean)
+    # a mock query axis vectorizes to per-point 1x1 covariances
+    batched_mean, batched_cov = model.predict(xs[:, None])
+    assert batched_cov.shape == (len(xs), o, 1, 1)
+    assert np.allclose(rearrange(batched_mean, "m o 1 -> o m"), mean)
 
 
 def test_x_update_loss_grad_matches_finite_differences(toy_data):
@@ -107,14 +110,7 @@ def test_x_update_loss_grad_matches_finite_differences(toy_data):
     d = design.shape[1]
     x = jnp.asarray(rng.uniform(0.5, 1.5, size=(d + 1,)))
     target_theta = jnp.asarray(rng.uniform(0.5, 1.5, size=(d,)))
-    args = (
-        target_theta,
-        jnp.array(2.0),
-        design,
-        y_train[:, 0],
-        jnp.array(1e-4),
-        jnp.array(100.0),
-    )
+    args = (target_theta, jnp.array(2.0), design, y_train[:, 0])
 
     grad = jax.grad(x_update_loss)(x, args)
     step = 1e-6
@@ -131,14 +127,7 @@ def test_x_update_objective_is_flat_below_zero(toy_data):
     design = rearrange(x_train, "n d g -> n (d g)")
     d = design.shape[1]
     x = jnp.asarray(rng.uniform(0.5, 1.5, size=(d + 1,)))
-    args = (
-        jnp.zeros(d),
-        jnp.array(0.0),
-        design,
-        y_train[:, 0],
-        jnp.array(1e-4),
-        jnp.array(100.0),
-    )
+    args = (jnp.zeros(d), jnp.array(0.0), design, y_train[:, 0])
 
     negative = x.at[: d // 2].set(-1.0)
     at_zero = x.at[: d // 2].set(0.0)
@@ -174,14 +163,7 @@ def test_inner_solver_stops_before_its_cap(toy_data):
     design = rearrange(x_train, "n d g -> n (d g)")
     d = design.shape[1]
     x0 = jnp.asarray(rng.uniform(0.5, 1.5, size=(d + 1,)))
-    args = (
-        jnp.zeros(d),
-        jnp.array(1.0),
-        design,
-        y_train[:, 0],
-        jnp.array(1e-4),
-        jnp.array(100.0),
-    )
+    args = (jnp.zeros(d), jnp.array(1.0), design, y_train[:, 0])
     bounds = (
         jnp.concat([jnp.zeros(d), jnp.array([-jnp.inf])]),
         jnp.full(d + 1, jnp.inf),
