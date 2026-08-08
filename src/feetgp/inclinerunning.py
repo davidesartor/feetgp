@@ -3,10 +3,13 @@ import numpy as np
 
 import os
 import pandas as pd
+from einops import rearrange
 from tqdm import tqdm
 
 
 class InclineRunning:
+    """Incline-running dataset with markers pre-grouped as (n, d, g) arrays."""
+
     marker_names: list[str] = [
         "CAL1",
         "CUB",
@@ -42,6 +45,7 @@ class InclineRunning:
         target: Literal["markers", "forces"] = "markers",
         inclines: Literal["all", "inc0", "inc5", "inc10"] = "all",
         relative: str | None = None,
+        ungroup_feet: bool = False,
     ):
         self.path = path
         if feet == "both":
@@ -54,6 +58,7 @@ class InclineRunning:
             self.markers = ["R" + name for name in self.marker_names]
         else:
             raise ValueError(f"feet must be 'both|left_only|right_only', got {feet}")
+        self.group_size = 6 if (feet == "both" and not ungroup_feet) else 3
 
         df_markers = self.load_marker_data(inclines, relative)
         x = df_markers.values
@@ -62,9 +67,7 @@ class InclineRunning:
 
         if target == "forces":
             df_forces = self.load_ground_reaction_forces(inclines)
-            y = np.cbrt(
-                df_forces.values
-            )
+            y = np.cbrt(df_forces.values)
             self.y_columns = list(df_forces.columns)
         elif target == "markers":
             y = x.copy()
@@ -91,6 +94,21 @@ class InclineRunning:
         y_std = np.where(y_std == 0, 1, y_std)
         self.y_train = (self.y_train - y_mean) / y_std
         self.y_test = (self.y_test - y_mean) / y_std
+
+        # consecutive g columns form one group: same marker across feet and coords
+        self.x_train = rearrange(self.x_train, "n (d g) -> n d g", g=self.group_size)
+        self.x_test = rearrange(self.x_test, "n (d g) -> n d g", g=self.group_size)
+        self.group_labels = [
+            self.group_label(self.x_columns[i : i + self.group_size])
+            for i in range(0, len(self.x_columns), self.group_size)
+        ]
+
+    @staticmethod
+    def group_label(columns: list[str]) -> str:
+        names = sorted({c.rsplit(" ", 1)[0] for c in columns})
+        if len(names) == 1:
+            return f"{names[0][0]} {names[0][1:]}"
+        return names[0][1:]
 
     def load_marker_data(
         self,

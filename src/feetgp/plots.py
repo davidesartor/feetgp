@@ -10,22 +10,6 @@ from plotly.subplots import make_subplots
 
 from feetgp.gp import CERTIFICATE_TOLERANCE
 
-MARKERS = [
-    "CAL1",
-    "CUB",
-    "LCAL",
-    "LMAL",
-    "MCAL",
-    "MMAL",
-    "MT1B",
-    "MT1H",
-    "MT2H",
-    "MT5B",
-    "MT5H",
-    "NAV",
-    "TOE",
-]
-
 COLORS = [
     "#1f77b4",
     "#ff7f0e",
@@ -85,47 +69,17 @@ def run_name_from_dir(run_dir: str, results_dir: str) -> str:
     return rel.replace(os.sep, "_")
 
 
-FORCE_LABELS = ["Fx", "Fy", "Fz"]
-
-
-def labels_from_run_dir(run_dir: str) -> tuple[int, list[str], str]:
-    feet = "both"
-    ungrouped = False
-    relative_marker = None
-    target = "markers"
-    for part in run_dir.split(os.sep):
-        if part.startswith("feet="):
-            feet = part.split("=", 1)[1].replace("_ungrouped", "")
-            ungrouped = "ungrouped" in part
-        if part.startswith("target="):
-            target = part.split("=", 1)[1]
-        if "relative=" in part:
-            relative_marker = part.split("relative=")[1]
-    group_size = 3 if ungrouped or feet != "both" else 6
-
-    active_markers = [m for m in MARKERS if m != relative_marker]
-    if feet != "both":
-        side = "L" if feet == "left_only" else "R"
-        group_labels = [f"{side} {m}" for m in active_markers]
-    elif ungrouped:
-        group_labels = [f"{side} {m}" for m in active_markers for side in ("L", "R")]
-    else:
-        group_labels = active_markers
-    return group_size, group_labels, target
-
-
 def plot_run(run_dir: str, results_dir: str):
     meta_path = os.path.join(run_dir, "meta.json")
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        group_size = meta["group_size"]
-        group_labels = meta["group_labels"]
-        target = meta["args"]["target"]
-        force_labels = meta["y_columns"]
-    else:
-        group_size, group_labels, target = labels_from_run_dir(run_dir)
-        force_labels = FORCE_LABELS
+    if not os.path.exists(meta_path):
+        print("  No meta.json, skipping.")
+        return
+    with open(meta_path) as f:
+        meta = json.load(f)
+    group_size = meta["group_size"]
+    group_labels = meta["group_labels"]
+    target = meta["args"]["target"]
+    force_labels = meta["y_columns"]
 
     data = load_run(run_dir)
     if data is None:

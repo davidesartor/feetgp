@@ -16,14 +16,13 @@ from sklearn.metrics import r2_score
 
 from feetgp import glasso_admm
 from feetgp import gp
-from feetgp import linear
 from feetgp.gp import GroupLassoGaussianProcess, hetgpy_auto_bounds
 from feetgp.linear import GroupLassoLinear
 from feetgp.inclinerunning import InclineRunning
 
 jax.config.update("jax_enable_x64", True)
 
-STATE_FORMAT = 5
+STATE_FORMAT = 6
 
 LAMBDA_START_FRACTION = 0.02
 
@@ -59,7 +58,6 @@ if __name__ == "__main__":
     parser.add_argument("--inner_max_linesearch", type=int, default=5)
     parser.add_argument("--history_length", type=int, default=40)
     parser.add_argument("--adapt_rho_iters", type=int, default=None)
-    parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--lambda_budget", type=int, default=100)
     parser.add_argument("--lambda_step", type=float, default=1.3)
     parser.add_argument("--lambda_refine", type=int, default=25)
@@ -67,7 +65,6 @@ if __name__ == "__main__":
     parser.add_argument("--overwrite", action="store_true", default=False)
     args = parser.parse_args()
 
-    group_size = 6 if (args.feet == "both" and not args.ungroup_feet) else 3
     autoregressive = args.target == "markers"
 
     run_name = (
@@ -88,6 +85,7 @@ if __name__ == "__main__":
         target=args.target,
         inclines=args.inclines,
         relative=args.relative,
+        ungroup_feet=args.ungroup_feet,
     )
 
     x_train = jnp.asarray(data.x_train)
@@ -95,7 +93,7 @@ if __name__ == "__main__":
     x_test = jnp.asarray(data.x_test)
     y_test = jnp.asarray(data.y_test)
 
-    n, d = x_train.shape
+    n, d, group_size = x_train.shape
     _, o = y_train.shape
 
     def git_revision() -> tuple[str | None, bool]:
@@ -119,12 +117,6 @@ if __name__ == "__main__":
             return None, False
         return rev.stdout.strip(), bool(status.stdout.strip())
 
-    def group_label(columns: list[str]) -> str:
-        names = sorted({c.rsplit(" ", 1)[0] for c in columns})
-        if len(names) == 1:
-            return f"{names[0][0]} {names[0][1:]}"
-        return names[0][1:]
-
     revision, dirty = git_revision()
     if dirty:
         print(
@@ -142,10 +134,7 @@ if __name__ == "__main__":
         git_dirty=dirty,
         x_columns=data.x_columns,
         y_columns=data.y_columns,
-        group_labels=[
-            group_label(data.x_columns[i : i + group_size])
-            for i in range(0, d, group_size)
-        ],
+        group_labels=data.group_labels,
     )
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -168,19 +157,12 @@ if __name__ == "__main__":
 
     chunk_size = min(args.chunk_size, y_train.shape[1])
 
-    admm_state_from_legacy = (
-        linear.admm_state_from_legacy
-        if args.linear_model
-        else gp.admm_state_from_legacy
-    )
-
     def fit(l1_penalty: float, warmstart=None):
         model_cls = GroupLassoLinear if args.linear_model else GroupLassoGaussianProcess
         return model_cls.fit(
             x_train=x_train,
             y_train=y_train,
             l1_penalty=jnp.array(l1_penalty),
-            group_size=group_size,
             autoregressive=autoregressive,
             warmstart=warmstart,
             auto_bounds=auto_bounds,
@@ -192,18 +174,21 @@ if __name__ == "__main__":
             inner_pgtol=args.inner_tol,
             inner_max_linesearch=args.inner_max_linesearch,
             history_length=args.history_length,
-            log_every=args.log_every,
         )
 
     def random_start(l1_penalty: float, k: int) -> glasso_admm.ADMMState:
         rng = np.random.default_rng([k, int(np.float64(l1_penalty).view(np.uint64))])
         lower, upper = auto_bounds
         low, high = np.sqrt(2.0 / upper), np.sqrt(2.0 / lower)
-        theta = np.exp(rng.uniform(np.log(low), np.log(high), size=(o, d)))
+        theta = np.exp(rng.uniform(np.log(low), np.log(high), size=(o, d, group_size)))
         g_min, g_max = (jnp.array(g) for g in gp.G_RANGE)
         w = gp.w_from_nugget(jnp.array(0.1), g_min, g_max)
-        return glasso_admm.ADMMState.initialize(
-            glasso_admm.to_groups(jnp.asarray(theta), group_size),
+        x0 = rearrange(jnp.asarray(theta), "o d g -> o g d")
+        return glasso_admm.ADMMState(
+            x=x0,
+            z=x0,
+            u=jnp.zeros_like(x0),
+            rho=jnp.array(1.0),
             aux=jnp.full((o,), float(w)),
         )
 
@@ -231,12 +216,7 @@ if __name__ == "__main__":
             model, llk, state, info = fit(l1_penalty, warmstart=start)
             objective = float(
                 gp.penalized_objective(
-                    model.theta,
-                    model.g,
-                    jnp.asarray(l1_penalty),
-                    x_train,
-                    y_train,
-                    group_size,
+                    model.theta, model.g, jnp.asarray(l1_penalty), x_train, y_train
                 )
             )
             fits[label] = (objective, model, llk, state, info)
@@ -262,7 +242,7 @@ if __name__ == "__main__":
     def group_norms(
         model: GroupLassoGaussianProcess | GroupLassoLinear,
     ) -> Float[NDArray, "d"]:
-        groups = rearrange(model.theta, "o (d g) -> d (o g)", g=group_size)
+        groups = rearrange(model.theta, "o d g -> d (o g)")
         norms = np.linalg.norm(np.asarray(groups), axis=-1)
         return norms
 
@@ -328,16 +308,10 @@ if __name__ == "__main__":
             n_groups = len(results["group_norms"])
             print(f"lambda = {l1_penalty:.4g} (cached, resuming)")
             print(f"    active groups = {n_active}/{n_groups}")
-            state_format = results.get("state_format")
-            state = results.get("admm_state")
-            if state_format == 4 and state is not None:
-                state = admm_state_from_legacy(state)
-            elif state_format != STATE_FORMAT:
-                print(
-                    "    stale pickle (older nugget parametrization), warmstarting cold"
-                )
+            if results.get("state_format") != STATE_FORMAT:
+                print("    stale pickle (older state format), warmstarting cold")
                 return results, None
-            return results, state
+            return results, results.get("admm_state")
         model, llk, state, info = fit_multistart(l1_penalty, warmstart=warmstart)
         results = record(l1_penalty, model, llk, state, info)
         return results, state

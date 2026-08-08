@@ -1,106 +1,63 @@
-from typing import NamedTuple, Optional, Self
-from jaxtyping import Array, Float, Scalar
+from typing import NamedTuple, Self
+from jaxtyping import Array, Bool, Int, Float
 
-import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from feetgp import glasso_admm
-from feetgp.glasso_admm import ADMMState
+from einops import rearrange, einsum
 
-jax.config.update("jax_enable_x64", True)
-
-
-class GLASSOADMMState(NamedTuple):
-
-    x: Float[Array, "o d*g"]
-    z: Float[Array, "o d*g"]
-    u: Float[Array, "o d*g"]
-    rho: Scalar
-    l1: Scalar
-    group_size: int
-
-
-def admm_state_from_legacy(legacy: GLASSOADMMState) -> ADMMState:
-    x, z, u = (
-        glasso_admm.to_groups(v, legacy.group_size) for v in (legacy.x, legacy.z, legacy.u)
-    )
-    return ADMMState(x=x, z=z, u=u, rho=legacy.rho)
-
-
-def admm_state_from_pickle(results: dict) -> ADMMState:
-    state = results["admm_state"]
-    if isinstance(state, GLASSOADMMState):
-        return admm_state_from_legacy(state)
-    return state
-
-
-@eqx.filter_jit
-def x_update_solve(
-    target: Float[Array, "o d*g"],
-    x_train: Float[Array, "n d*g"],
-    y_train: Float[Array, "n o"],
-    rho: Scalar,
-) -> Float[Array, "o d*g"]:
-    _, d = x_train.shape
-    A = x_train.T @ x_train + rho * jnp.eye(d)
-    b = x_train.T @ y_train + rho * target.T
-    return jnp.linalg.solve(A, b).T
+from feetgp.glasso_admm import ADMMState, solve
 
 
 class GroupLassoLinear(NamedTuple):
-    theta: Float[Array, "o d*g"]
-    x_train: Float[Array, "n d*g"]
+    theta: Float[Array, "o d g"]
+    bias: Float[Array, "o"]
+    x_train: Float[Array, "n d g"]
     y_train: Float[Array, "n o"]
 
-    @jax.jit
-    def predict(self, xs: Float[Array, "m d*g"]) -> Float[Array, "o m"]:
-        return self.theta @ xs.T
+    @eqx.filter_jit
+    def predict(self, xs: Float[Array, "m d g"]) -> Float[Array, "m o"]:
+        return einsum(self.theta, xs, "o d g, m d g -> m o") + self.bias
 
     @classmethod
     def fit(
         cls,
-        x_train: Float[Array, "n d*g"],
+        x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
-        l1_penalty: Scalar,
-        group_size: int,
         *,
-        warmstart: Optional[ADMMState] = None,
-        max_iterations: int = 1000,
-        tol: Scalar = jnp.array(1e-3),
-        adapt_rho: bool = True,
-        adapt_rho_iters: Optional[int] = None,
-        log_every: int = 0,
+        fit_intercept: bool = True,
         **kwargs,
-    ) -> tuple[Self, Scalar, ADMMState, dict]:
-        _, d_times_g = x_train.shape
+    ) -> tuple[Self, Float[Array, ""], Bool[Array, ""], Int[Array, ""]]:
+        _, d, g = x_train.shape
         _, o = y_train.shape
-        assert d_times_g % group_size == 0
 
-        state = warmstart or ADMMState.initialize(
-            jnp.zeros((d_times_g // group_size, o * group_size))
+        # intercept is unpenalized, so centering gives it in closed form
+        x_mean = x_train.mean(axis=0) if fit_intercept else jnp.zeros((d, g))
+        y_mean = y_train.mean(axis=0) if fit_intercept else jnp.zeros((o,))
+
+        # precompute constant matrices
+        design = rearrange(x_train - x_mean, "n d g -> n (d g)")
+        A0 = design.T @ design  # (d g) (d g)
+        b0 = design.T @ (y_train - y_mean)  # (d g) o
+
+        # define the x update function for ADMM (group axis d last, per glasso_admm)
+        def x_update(state: ADMMState) -> ADMMState:
+            # closed form of quadratic minimization step
+            # min_x 0.5 ||y - X x||_2^2 + (rho / 2) ||x - z + u||_2^2
+            target = rearrange(state.z - state.u, "(o g) d -> (d g) o", g=g)
+            A = A0 + state.rho * jnp.eye(d * g)
+            b = b0 + state.rho * target
+            x = rearrange(jnp.linalg.solve(A, b), "(d g) o -> (o g) d", g=g)
+            return state._replace(x=x)
+
+        # run the ADMM solver loop
+        state, converged, iterations = solve(
+            x_update, x0=jnp.zeros((o * g, d)), **kwargs
         )
 
-        def x_update(state: ADMMState, _: int) -> tuple[ADMMState, bool]:
-            target = glasso_admm.to_outputs(state.z - state.u, group_size)
-            x = x_update_solve(target, x_train, y_train, state.rho)
-            return state._replace(x=glasso_admm.to_groups(x, group_size)), True
-
-        state, info = glasso_admm.solve(
-            x_update,
-            state,
-            l1_penalty,
-            max_iterations=max_iterations,
-            tol=tol,
-            adapt_rho=adapt_rho,
-            adapt_rho_iters=adapt_rho_iters,
-            log_every=log_every,
-        )
-
-        model = cls(
-            theta=glasso_admm.to_outputs(state.z, group_size),
-            x_train=x_train,
-            y_train=y_train,
-        )
-        loss = 0.5 * jnp.sum((y_train.T - model.predict(x_train)) ** 2)
-        return model, loss, state, info
+        # build the final model and compute the training loss
+        theta = rearrange(state.z, "(o g) d -> o d g", g=g)
+        bias = y_mean - einsum(theta, x_mean, "o d g, d g -> o")
+        model = cls(theta=theta, bias=bias, x_train=x_train, y_train=y_train)
+        loss = 0.5 * jnp.sum((y_train - model.predict(x_train)) ** 2)
+        return model, loss, converged, iterations

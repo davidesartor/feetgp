@@ -1,4 +1,3 @@
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -6,7 +5,7 @@ import pytest
 from scipy.optimize import Bounds
 from scipy.optimize import minimize as scipy_minimize
 
-from feetgp.gp import admm_x_update_loss, nugget_from_w
+from feetgp.gp import nugget_from_w, x_update_loss
 
 minimise = pytest.importorskip("vlse.optim", reason="jaxvlse is not installed").minimise
 
@@ -48,7 +47,7 @@ def test_gp_x_update_matches_scipy():
     upper = jnp.concatenate([jnp.full(d, 3.0), jnp.array([jnp.inf])])
 
     state = minimise(
-        admm_x_update_loss,
+        x_update_loss,
         x0,
         (lower, upper),
         args=(args,),
@@ -56,7 +55,7 @@ def test_gp_x_update_matches_scipy():
         max_iterations=500,
     )
     x_scipy, f_scipy = scipy_reference(
-        admm_x_update_loss, x0, lower, upper, args=args, tol=TOL
+        x_update_loss, x0, lower, upper, args=args, tol=TOL
     )
 
     assert state.f <= f_scipy + 1e-8 * (1.0 + abs(f_scipy))
