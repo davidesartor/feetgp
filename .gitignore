@@ -1,3 +1,6 @@
+# agent guidance, kept local
+CLAUDE.md
+
 # Ignore xlsx, mat, qtm, tsv, npz, and txt files
 *.xlsx
 *.mat
