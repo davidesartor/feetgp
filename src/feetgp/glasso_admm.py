@@ -57,7 +57,6 @@ def check_residuals(
     return state, primal_ok, dual_ok
 
 
-@eqx.filter_jit
 def solve(
     x_update: UpdateX,
     x0: Float[Array, "... g"],

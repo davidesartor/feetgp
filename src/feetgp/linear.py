@@ -16,10 +16,11 @@ class GroupLassoLinear(NamedTuple):
     y_train: Float[Array, "n o"]
 
     @eqx.filter_jit
-    def predict(self, xs: Float[Array, "m d g"]) -> Float[Array, "m o"]:
-        return einsum(self.theta, xs, "o d g, m d g -> m o") + self.bias
+    def predict(self, x: Float[Array, "m d g"]) -> Float[Array, "m o"]:
+        return einsum(self.theta, x, "o d g, m d g -> m o") + self.bias
 
     @classmethod
+    @eqx.filter_jit
     def fit(
         cls,
         x_train: Float[Array, "n d g"],
@@ -37,13 +38,12 @@ class GroupLassoLinear(NamedTuple):
 
         # precompute constant matrices
         design = rearrange(x_train - x_mean, "n d g -> n (d g)")
-        A0 = design.T @ design  # (d g) (d g)
-        b0 = design.T @ (y_train - y_mean)  # (d g) o
+        A0 = einsum(design, design, "n i, n j -> i j")
+        b0 = einsum(design, y_train - y_mean, "n i, n o -> i o")
 
-        # define the x update function for ADMM (group axis d last, per glasso_admm)
+        # closed form of the quadratic minimization step
+        # min_x 0.5 ||y - X x||_2^2 + (rho / 2) ||x - z + u||_2^2
         def x_update(state: ADMMState) -> ADMMState:
-            # closed form of quadratic minimization step
-            # min_x 0.5 ||y - X x||_2^2 + (rho / 2) ||x - z + u||_2^2
             target = rearrange(state.z - state.u, "(o g) d -> (d g) o", g=g)
             A = A0 + state.rho * jnp.eye(d * g)
             b = b0 + state.rho * target
