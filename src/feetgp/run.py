@@ -1,6 +1,5 @@
-from jaxtyping import Float, Scalar
+from jaxtyping import Array, Float, Scalar
 from numpy.typing import NDArray
-from jaxtyping import Array
 
 import os
 import glob
@@ -11,28 +10,48 @@ import subprocess
 import numpy as np
 import jax
 import jax.numpy as jnp
-from einops import rearrange
+from einops import rearrange, reduce
 from sklearn.metrics import r2_score
 
-from feetgp import glasso_admm
-from feetgp.gp import GroupLassoGaussianProcess, hetgpy_auto_bounds
-from feetgp.linear import GroupLassoLinear
+from feetgp.glasso_admm import ADMMState
+from feetgp.gp import AutoregressiveGaussianProcess, GaussianProcess
+from feetgp.linear import AutoregressiveLinear, Linear
 from feetgp.inclinerunning import InclineRunning
 
-jax.config.update("jax_enable_x64", True)
-
-STATE_FORMAT = 6
+STATE_FORMAT = 9
 
 LAMBDA_START_FRACTION = 0.02
 
 print("JAX devices:", jax.devices())
 
 
-if __name__ == "__main__":
+Model = GaussianProcess | AutoregressiveGaussianProcess | Linear | AutoregressiveLinear
+
+
+def git_revision() -> tuple[str | None, bool]:
+    """Commit hash and whether the tree is dirty, both None/False outside git."""
+    git_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def run(*command: str) -> str:
+        result = subprocess.run(
+            command, cwd=git_dir, capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+
+    try:
+        return run("git", "rev-parse", "HEAD"), bool(
+            run("git", "status", "--porcelain")
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None, False
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--data_dir", type=str, default="data/Incline Running")
-    parser.add_argument("--subsample", type=int, default=1)
+    parser.add_argument("--train_size", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--feet", type=str, default="both", choices=["both", "left_only", "right_only"]
     )
@@ -44,6 +63,9 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--linear_model", action="store_true", default=False)
+    parser.add_argument(
+        "--profile", type=str, default="rbf", choices=["rbf", "matern52"]
+    )
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
     parser.add_argument(
         "--relative", type=str, nargs="?", default=None, const="midpoint"
@@ -51,26 +73,24 @@ if __name__ == "__main__":
 
     parser.add_argument("--maxiter", type=int, default=300)
     parser.add_argument("--tol", type=float, default=1e-3)
-    parser.add_argument("--chunk_size", type=int, default=8)
-    parser.add_argument("--inner_maxiter", type=int, default=5)
-    parser.add_argument("--inner_tol", type=float, default=1e-2)
-    parser.add_argument("--inner_max_linesearch", type=int, default=5)
-    parser.add_argument("--history_length", type=int, default=40)
-    parser.add_argument("--adapt_rho_iters", type=int, default=None)
     parser.add_argument("--lambda_budget", type=int, default=100)
     parser.add_argument("--lambda_step", type=float, default=1.3)
     parser.add_argument("--lambda_refine", type=int, default=25)
-    parser.add_argument("--n_starts", type=int, default=3)
     parser.add_argument("--overwrite", action="store_true", default=False)
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # markers are their own targets, so that run is the autoregressive one
     autoregressive = args.target == "markers"
 
     run_name = (
         f"model={'linear' if args.linear_model else 'gp'}"
         f"/target={args.target}"
         f"/feet={args.feet}{'_ungrouped' if args.ungroup_feet else ''}"
-        f"/inclines={args.inclines}_sub={args.subsample}"
+        f"/inclines={args.inclines}_n={args.train_size or 'half'}_seed={args.seed}"
         f"{f'_relative={args.relative}' if args.relative else ''}"
     )
     save_dir = os.path.join(args.output_dir, run_name)
@@ -79,7 +99,8 @@ if __name__ == "__main__":
 
     data = InclineRunning(
         path=args.data_dir,
-        subsample=args.subsample,
+        train_size=args.train_size,
+        seed=args.seed,
         feet=args.feet,
         target=args.target,
         inclines=args.inclines,
@@ -88,33 +109,16 @@ if __name__ == "__main__":
     )
 
     x_train = jnp.asarray(data.x_train)
-    y_train = jnp.asarray(data.y_train)
     x_test = jnp.asarray(data.x_test)
-    y_test = jnp.asarray(data.y_test)
+    n, d, g = x_train.shape
 
-    n, d, group_size = x_train.shape
-    _, o = y_train.shape
-
-    def git_revision() -> tuple[str | None, bool]:
-        try:
-            git_dir = os.path.dirname(os.path.abspath(__file__))
-            rev = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=git_dir,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=git_dir,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except (subprocess.CalledProcessError, OSError):
-            return None, False
-        return rev.stdout.strip(), bool(status.stdout.strip())
+    # the autoregressive fits take no targets, and score against their own inputs
+    if autoregressive:
+        y_train, y_test = (rearrange(x, "n d g -> n (d g)") for x in (x_train, x_test))
+    else:
+        y_train = jnp.asarray(data.y_train)
+        y_test = jnp.asarray(data.y_test)
+    o = y_train.shape[1]
 
     revision, dirty = git_revision()
     if dirty:
@@ -126,7 +130,8 @@ if __name__ == "__main__":
 
     meta = dict(
         args=vars(args),
-        group_size=group_size,
+        group_size=d,
+        n_groups=g,
         autoregressive=autoregressive,
         run_name=run_name,
         git_revision=revision,
@@ -152,115 +157,58 @@ if __name__ == "__main__":
                 return path
         return None
 
-    chunk_size = min(args.chunk_size, y_train.shape[1])
+    def fit(l1_penalty: float, warmstart: ADMMState | None = None):
+        targets = () if autoregressive else (y_train,)
+        if args.linear_model:
+            # the linear x update is closed form, so there is nothing to warmstart
+            model_cls = AutoregressiveLinear if autoregressive else Linear
+            return model_cls.fit(
+                x_train,
+                *targets,
+                jnp.array(l1_penalty),
+                max_iterations=args.maxiter,
+                tol=jnp.array(args.tol),
+            )
 
-    def fit(l1_penalty: float, warmstart=None):
-        model_cls = GroupLassoLinear if args.linear_model else GroupLassoGaussianProcess
+        model_cls = AutoregressiveGaussianProcess if autoregressive else GaussianProcess
         return model_cls.fit(
-            x_train=x_train,
-            y_train=y_train,
-            l1_penalty=jnp.array(l1_penalty),
-            autoregressive=autoregressive,
+            x_train,
+            *targets,
+            jnp.array(l1_penalty),
+            profile=args.profile,
             warmstart=warmstart,
             max_iterations=args.maxiter,
             tol=jnp.array(args.tol),
-            adapt_rho_iters=args.adapt_rho_iters,
-            chunk_size=chunk_size,
-            inner_maxiter=args.inner_maxiter,
-            inner_pgtol=args.inner_tol,
-            inner_max_linesearch=args.inner_max_linesearch,
-            history_length=args.history_length,
         )
 
-    def random_start(l1_penalty: float, k: int) -> glasso_admm.ADMMState:
-        rng = np.random.default_rng([k, int(np.float64(l1_penalty).view(np.uint64))])
-        lower, upper = hetgpy_auto_bounds(rearrange(x_train, "n d g -> n (d g)"))
-        low, high = (
-            rearrange(np.sqrt(2.0 / bound), "(d g) -> d g", g=group_size)
-            for bound in (upper, lower)
-        )
-        theta = np.exp(rng.uniform(np.log(low), np.log(high), size=(o, d, group_size)))
-        w = jnp.log(0.1)
-        x0 = rearrange(jnp.asarray(theta), "o d g -> o g d")
-        return glasso_admm.ADMMState(
-            x=x0,
-            z=x0,
-            u=jnp.zeros_like(x0),
-            rho=jnp.array(1.0),
-            aux=jnp.full((o,), float(w)),
-        )
+    def group_norms(model: Model) -> Float[NDArray, "g"]:
+        norms = jnp.sqrt(reduce(model.theta**2, "... g -> g", "sum"))
+        return np.asarray(norms)
 
-    def fit_multistart(l1_penalty: float, warmstart=None):
-        if args.linear_model or args.n_starts == 1:
-            return fit(l1_penalty, warmstart=warmstart)
-
-        starts = [("chained" if warmstart is not None else "default", warmstart)]
-        chained_is_dense = (
-            warmstart is not None
-            and states.get(0.0) is not None
-            and warmstart.x is states[0.0].x
-        )
-        if l1_penalty > 0 and states.get(0.0) is not None and not chained_is_dense:
-            starts.append(("dense", states[0.0]._replace(rho=jnp.array(1.0))))
-        while len(starts) < args.n_starts:
-            starts.append(
-                (f"random_{len(starts)}", random_start(l1_penalty, len(starts)))
-            )
-        starts = starts[: args.n_starts]
-
-        print(f"lambda = {l1_penalty:.4g}, {len(starts)} starts")
-        fits = {}
-        for label, start in starts:
-            model, llk, state, info = fit(l1_penalty, warmstart=start)
-            norms = jnp.linalg.norm(rearrange(model.theta, "o d g -> d (o g)"), axis=-1)
-            objective = float(-llk + l1_penalty * norms.sum())
-            fits[label] = (objective, model, llk, state, info)
-            print(
-                f"    start {label}: objective = {objective:.6f},"
-                f" converged = {info['converged']} in {info['iterations']} iterations"
-            )
-
-        winner = min(fits, key=lambda label: fits[label][0])
-        objective, model, llk, state, info = fits[winner]
-        info["winner"] = winner
-        info["start_objectives"] = {label: fits[label][0] for label in fits}
-        info["starts"] = {
-            label: dict(
-                converged=bool(fits[label][4]["converged"]),
-                iterations=int(fits[label][4]["iterations"]),
-            )
-            for label in fits
-        }
-        print(f"    winner = {winner}")
-        return model, llk, state, info
-
-    def group_norms(
-        model: GroupLassoGaussianProcess | GroupLassoLinear,
-    ) -> Float[NDArray, "d"]:
-        groups = rearrange(model.theta, "o d g -> d (o g)")
-        norms = np.linalg.norm(np.asarray(groups), axis=-1)
-        return norms
-
-    def r2_scores(
-        model: GroupLassoGaussianProcess | GroupLassoLinear,
-        x: Float[Array, "m d"],
-        y: Float[Array, "m o"],
-    ) -> Float[Array, "o"]:
-        if isinstance(model, GroupLassoLinear):
-            y_pred = np.array(model.predict(x))
+    def predict(model: Model, x: Float[Array, "m d g"]) -> Float[NDArray, "m o"]:
+        if args.linear_model:
+            prediction = model.predict(x)
         else:
             # mock query dim: per-point 1x1 covariance instead of full m x m
-            mean, _ = model.predict(x[:, None])
-            y_pred = np.array(rearrange(mean, "m o 1 -> o m"))
-        r2 = jnp.array([r2_score(y[:, j], y_pred[j, :]) for j in range(o)])
-        return r2
+            prediction, _ = model.predict(x[:, None])
+            prediction = rearrange(prediction, "m ... 1 -> m ...")
+        return np.asarray(rearrange(prediction, "m ... -> m (...)"))
+
+    def r2_scores(
+        model: Model, x: Float[Array, "m d g"], y: Float[Array, "m o"]
+    ) -> Float[NDArray, "o"]:
+        return r2_score(np.asarray(y), predict(model, x), multioutput="raw_values")
+
+    def without_training_data(model: Model) -> Model:
+        fields = {f: None for f in ("x_train", "y_train") if f in model._fields}
+        return model._replace(**fields)
 
     def record(
         l1_penalty: float,
-        model: GroupLassoGaussianProcess | GroupLassoLinear,
-        llk: Scalar,
-        admm_state,
-        info: dict,
+        model: Model,
+        loss: Scalar,
+        state: ADMMState,
+        certificate: Float[Array, "g"],
     ) -> dict:
         gn = group_norms(model)
         r2_test = r2_scores(model, x_test, y_test)
@@ -268,38 +216,36 @@ if __name__ == "__main__":
         n_active = int(np.sum(gn > 1e-8))
         print(f"lambda = {l1_penalty:.4g}")
         print(
-            f"    converged = {info['converged']} in {info['iterations']} iterations"
-            f" (r={info.get('primal_residual', float('nan')):.3e},"
-            f" s={info.get('dual_residual', float('nan')):.3e})"
+            f"    converged = {bool(state.converged(args.tol))}"
+            f" in {int(state.iteration)} iterations"
+            f" (r={float(state.primal_residual):.3e},"
+            f" s={float(state.dual_residual):.3e})"
         )
         print(f"    active groups = {n_active}/{len(gn)}")
         print(f"    max gnorm = {gn.max():.4f}")
+        print(f"    max kkt violation = {float(jnp.max(certificate)):.3e}")
         print(f"    r2 (test)  = [{r2_test.min():.3f}, {r2_test.max():.3f}]")
         print(f"    r2 (train) = [{r2_train.min():.3f}, {r2_train.max():.3f}]")
-        certificate = info.get("certificate")
-        if certificate is not None:
-            print(
-                f"    max live KKT = {float(certificate['max_live_kkt']):.3e}"
-                f" (nugget grad {float(certificate['nugget_grad']):.3e})"
-            )
 
         results = dict(
             l1_penalty=l1_penalty,
-            model=model._replace(x_train=None, y_train=None),
-            admm_state=admm_state,
+            model=without_training_data(model),
+            admm_state=state,
+            certificate=np.asarray(certificate),
             group_norms=gn,
             r2_test=r2_test,
             r2_train=r2_train,
-            llk=llk,
+            loss=loss,
             n_active=n_active,
-            info=info,
             state_format=STATE_FORMAT,
         )
         with open(cache_path(l1_penalty), "wb") as f:
             pickle.dump(results, f)
         return results
 
-    def fit_or_load(l1_penalty: float, warmstart=None) -> tuple[dict, object]:
+    def fit_or_load(
+        l1_penalty: float, warmstart: ADMMState | None = None
+    ) -> tuple[dict, ADMMState | None]:
         cached = find_cached(l1_penalty)
         if not args.overwrite and cached is not None:
             with open(cached, "rb") as f:
@@ -312,34 +258,36 @@ if __name__ == "__main__":
                 print("    stale pickle (older state format), warmstarting cold")
                 return results, None
             return results, results.get("admm_state")
-        model, llk, state, info = fit_multistart(l1_penalty, warmstart=warmstart)
-        results = record(l1_penalty, model, llk, state, info)
-        return results, state
+        results = record(l1_penalty, *fit(l1_penalty, warmstart=warmstart))
+        return results, results["admm_state"]
 
     path: dict[float, int] = {}
-    states: dict[float, object] = {}
+    states: dict[float, ADMMState | None] = {}
 
-    def fit_and_track(l1_penalty: float, warmstart=None) -> dict:
+    def fit_and_track(l1_penalty: float, warmstart: ADMMState | None = None) -> dict:
         l1_penalty = float(l1_penalty)
         results, state = fit_or_load(l1_penalty, warmstart=warmstart)
         path[l1_penalty] = results["n_active"]
         states[l1_penalty] = state
         return results
 
-    results = fit_and_track(0.0, warmstart=None)
-    unpenalized_warmstart = states[0.0]._replace(rho=jnp.array(1.0))
+    # the unpenalized fit anchors the path and warmstarts every descent from dense
+    results = fit_and_track(0.0)
+    dense_warmstart = states[0.0]
     gn = results["group_norms"]
     n_groups = len(gn)
 
+    # back off until a penalty keeps the full support alive
     l1_penalty = LAMBDA_START_FRACTION * float(gn.max())
     for _ in range(args.lambda_budget):
-        results = fit_and_track(l1_penalty, warmstart=unpenalized_warmstart)
+        results = fit_and_track(l1_penalty, warmstart=dense_warmstart)
         if results["n_active"] >= path[0.0]:
             break
         l1_penalty /= args.lambda_step
     else:
         print(f"No lambda holds the full support within {args.lambda_budget} steps.")
 
+    # climb until every group is dead, chaining warmstarts along the path
     warmstart = states[l1_penalty]
     for _ in range(args.lambda_budget):
         l1_penalty *= args.lambda_step
@@ -350,6 +298,7 @@ if __name__ == "__main__":
     else:
         print(f"Failed to kill every group within {args.lambda_budget} lambdas.")
 
+    # bisect wherever more than one group dies at once
     for _ in range(args.lambda_refine):
         grid = sorted(path)
         min_width = np.log(1.001)
