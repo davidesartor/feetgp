@@ -1,9 +1,10 @@
 import os
 import json
-import pickle
 import glob
 import argparse
 import numpy as np
+
+from feetgp.store import PATH_FILE, RunStore
 from einops import rearrange
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -44,31 +45,14 @@ COLORS_DARK = [
 
 
 def load_run(run_dir: str) -> dict | None:
-    files = glob.glob(os.path.join(run_dir, "lambda=*.pkl"))
-    if not files:
+    rows = RunStore.read_rows(run_dir)
+    if not rows:
         return None
-    results = []
-    for f in files:
-        with open(f, "rb") as fp:
-            r = pickle.load(fp)
-        r2 = np.asarray(r["r2_test"])
-        r2_train = (
-            np.asarray(r["r2_train"]) if "r2_train" in r else np.full_like(r2, np.nan)
-        )
-        results.append(
-            {
-                "l1_penalty": r["l1_penalty"],
-                "group_norms": np.asarray(r["group_norms"]),
-                "r2": r2,
-                "r2_train": r2_train,
-            }
-        )
-    results.sort(key=lambda r: r["l1_penalty"])
     return {
-        "lambdas": np.array([r["l1_penalty"] for r in results]),
-        "group_norms": np.stack([r["group_norms"] for r in results]),
-        "r2": np.stack([r["r2"] for r in results]),
-        "r2_train": np.stack([r["r2_train"] for r in results]),
+        "lambdas": np.array([r["l1_penalty"] for r in rows]),
+        "group_norms": np.stack([np.asarray(r["group_norms"]) for r in rows]),
+        "r2": np.stack([np.asarray(r["r2_test"]) for r in rows]),
+        "r2_train": np.stack([np.asarray(r["r2_train"]) for r in rows]),
     }
 
 
@@ -264,7 +248,7 @@ if __name__ == "__main__":
     run_dirs = sorted(
         set(
             os.path.dirname(f)
-            for f in glob.glob(os.path.join(args.results_dir, "*/*/*/*/lambda=*.pkl"))
+            for f in glob.glob(os.path.join(args.results_dir, f"*/*/*/*/{PATH_FILE}"))
         )
     )
     if not run_dirs:

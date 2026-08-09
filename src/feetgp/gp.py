@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import equinox as eqx
-from einops import rearrange, repeat, pack, unpack
+from einops import rearrange, reduce, repeat, pack, unpack
 from vlse.optim import minimise
 
 from feetgp.glasso_admm import ADMMState, solve, kkt_certificate
@@ -159,6 +159,40 @@ class GaussianProcess(NamedTuple):
         [mean] = unpack(mean, batch, "* o m")
         [cov] = unpack(cov, batch, "* o m1 m2")
         return mean, cov
+
+    @classmethod
+    @eqx.filter_jit
+    def lambda_max(
+        cls,
+        x_train: Float[Array, "n d g"],
+        y_train: Float[Array, "n o"],
+        *,
+        profile: KernelProfile,
+        nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
+    ) -> Float[Array, ""]:
+        """Smallest penalty that kills every group, from the gradient at theta = 0."""
+        _, d, g = x_train.shape
+        x_train_flat = rearrange(x_train, "n d g -> n (d g)")
+        theta_zero = jnp.zeros((d, g))
+
+        def negative_loglikelihood(theta, log_nugget, y):
+            theta = rearrange(theta, "d g -> (d g)")
+            Koo = kernel(profile, theta, x_train_flat, x_train_flat)
+            Koo = Koo + jnp.exp(log_nugget) * jnp.eye(len(y))
+            return -gp_loglikelihood(Koo, y)[0]
+
+        def gradient_at_zero(y: Float[Array, "n"]) -> Float[Array, "d g"]:
+            # the nugget is the only free parameter left when every group is dead
+            log_nugget = minimise(
+                lambda log_nugget: negative_loglikelihood(theta_zero, log_nugget, y),
+                x0=jnp.mean(jnp.log(nugget_range)),
+                bounds=(jnp.log(nugget_range[0]), jnp.log(nugget_range[1])),
+            ).x
+            return jax.grad(negative_loglikelihood)(theta_zero, log_nugget, y)
+
+        # theta sits on its lower bound, so only inward components can revive a group
+        grad = jnp.minimum(jax.vmap(gradient_at_zero)(y_train.T), 0.0)
+        return jnp.max(jnp.sqrt(reduce(grad**2, "... g -> g", "sum")))
 
     @classmethod
     @eqx.filter_jit

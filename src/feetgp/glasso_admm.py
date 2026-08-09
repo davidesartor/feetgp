@@ -83,7 +83,7 @@ def solve(
     l1_penalty: Float[Array, ""],
     *,
     max_iterations: int | Int[Array, ""] = jnp.array(300),
-    tol: float | Float[Array, ""] = jnp.array(1e-3),
+    tol: float | Float[Array, ""] = jnp.array(1e-5),
     adapt_rho: bool | Bool[Array, ""] = jnp.array(True),
 ) -> ADMMState:
     # define admm loop condition and body

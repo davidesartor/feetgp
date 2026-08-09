@@ -3,7 +3,7 @@ from jaxtyping import Array, Int, Float
 
 import jax.numpy as jnp
 import equinox as eqx
-from einops import rearrange, einsum
+from einops import rearrange, reduce, einsum
 
 from feetgp.glasso_admm import ADMMState, solve, kkt_certificate
 
@@ -15,6 +15,21 @@ class Linear(NamedTuple):
     @eqx.filter_jit
     def predict(self, x: Float[Array, "... d g"]) -> Float[Array, "... o"]:
         return einsum(self.theta, x, "o d g, ... d g -> ... o") + self.bias
+
+    @classmethod
+    @eqx.filter_jit
+    def lambda_max(
+        cls,
+        x_train: Float[Array, "n d g"],
+        y_train: Float[Array, "n o"],
+        *,
+        fit_intercept: bool = True,
+    ) -> Float[Array, ""]:
+        """Smallest penalty that kills every group, from the gradient at theta = 0."""
+        x_mean = x_train.mean(axis=0) if fit_intercept else 0.0
+        y_mean = y_train.mean(axis=0) if fit_intercept else 0.0
+        grad = einsum(x_train - x_mean, y_train - y_mean, "n d g, n o -> o d g")
+        return jnp.max(jnp.sqrt(reduce(grad**2, "... g -> g", "sum")))
 
     @classmethod
     @eqx.filter_jit

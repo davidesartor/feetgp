@@ -23,4 +23,3 @@ tests/        pytest, synthetic data only
 
 `CLEANUP-2026-08-08.md` carries the history: what was tried and failed, which measurements are
 obsolete, and the defects diagnosed but never fixed. The invariants that used to sit in `CLAUDE.md`
-— ADMM loop, λ sweep direction, column layout — are in git history at `git show 1e30a18:CLAUDE.md`.

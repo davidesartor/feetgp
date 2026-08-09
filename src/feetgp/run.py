@@ -1,10 +1,9 @@
+from typing import Callable
 from jaxtyping import Array, Float, Scalar
 from numpy.typing import NDArray
 
 import os
-import glob
 import json
-import pickle
 import argparse
 import subprocess
 import numpy as np
@@ -17,10 +16,7 @@ from feetgp.glasso_admm import ADMMState
 from feetgp.gp import GaussianProcess
 from feetgp.linear import Linear
 from feetgp.inclinerunning import InclineRunning
-
-STATE_FORMAT = 9
-
-LAMBDA_START_FRACTION = 0.02
+from feetgp.store import RunStore, model_to_arrays, state_to_arrays
 
 print("JAX devices:", jax.devices())
 
@@ -72,19 +68,69 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--maxiter", type=int, default=300)
-    parser.add_argument("--tol", type=float, default=1e-3)
-    parser.add_argument("--lambda_budget", type=int, default=100)
-    parser.add_argument("--lambda_step", type=float, default=1.3)
-    parser.add_argument("--lambda_refine", type=int, default=25)
+    parser.add_argument("--tol", type=float, default=1e-5)
+    parser.add_argument("--lambda_budget", type=int, default=40)
+    parser.add_argument("--lambda_ratio", type=float, default=0.85)
     parser.add_argument("--overwrite", action="store_true", default=False)
     return parser.parse_args()
 
 
+def linear_model(
+    args: argparse.Namespace,
+    x_train: Float[Array, "n d g"],
+    y_train: Float[Array, "n o"],
+) -> tuple[Callable, Callable, Callable]:
+    """Closed-form x update, so there is nothing to warmstart."""
+
+    def fit(l1_penalty: float, warmstart: ADMMState | None = None):
+        return Linear.fit(
+            x_train,
+            y_train,
+            jnp.array(l1_penalty),
+            max_iterations=args.maxiter,
+            tol=jnp.array(args.tol),
+        )
+
+    def predict(model: Linear, x: Float[Array, "m d g"]) -> Float[NDArray, "m o"]:
+        return np.asarray(model.predict(x))
+
+    def lambda_max() -> float:
+        return float(Linear.lambda_max(x_train, y_train))
+
+    return fit, predict, lambda_max
+
+
+def gp_model(
+    args: argparse.Namespace,
+    x_train: Float[Array, "n d g"],
+    y_train: Float[Array, "n o"],
+) -> tuple[Callable, Callable, Callable]:
+    def fit(l1_penalty: float, warmstart: ADMMState | None = None):
+        return GaussianProcess.fit(
+            x_train,
+            y_train,
+            jnp.array(l1_penalty),
+            profile=args.profile,
+            warmstart=warmstart,
+            max_iterations=args.maxiter,
+            tol=jnp.array(args.tol),
+        )
+
+    def predict(
+        model: GaussianProcess, x: Float[Array, "m d g"]
+    ) -> Float[NDArray, "m o"]:
+        # mock query dim: per-point 1x1 covariance instead of full m x m
+        mean, _ = model.predict(x[:, None])
+        return np.asarray(rearrange(mean, "m o 1 -> m o"))
+
+    def lambda_max() -> float:
+        return float(GaussianProcess.lambda_max(x_train, y_train, profile=args.profile))
+
+    return fit, predict, lambda_max
+
+
 if __name__ == "__main__":
     args = parse_args()
-
-    # markers are their own targets, so that run is the autoregressive one
-    autoregressive = args.target == "markers"
 
     run_name = (
         f"model={'linear' if args.linear_model else 'gp'}"
@@ -114,7 +160,6 @@ if __name__ == "__main__":
 
     y_train = jnp.asarray(data.y_train)
     y_test = jnp.asarray(data.y_test)
-    o = y_train.shape[1]
 
     revision, dirty = git_revision()
     if dirty:
@@ -128,7 +173,8 @@ if __name__ == "__main__":
         args=vars(args),
         group_size=d,
         n_groups=g,
-        autoregressive=autoregressive,
+        # markers are their own targets, so that run is the autoregressive one
+        autoregressive=args.target == "markers",
         run_name=run_name,
         git_revision=revision,
         git_dirty=dirty,
@@ -139,62 +185,19 @@ if __name__ == "__main__":
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    def cache_path(l1_penalty: float) -> str:
-        return os.path.join(save_dir, f"lambda={float(l1_penalty):.9e}.pkl")
+    store = RunStore(save_dir)
 
-    def find_cached(l1_penalty: float) -> str | None:
-        for path in glob.glob(os.path.join(save_dir, "lambda=*.pkl")):
-            name = os.path.basename(path).removeprefix("lambda=").removesuffix(".pkl")
-            try:
-                cached_penalty = float(name)
-            except ValueError:
-                continue
-            if np.isclose(cached_penalty, l1_penalty, rtol=1e-6, atol=0.0):
-                return path
-        return None
-
-    def fit(l1_penalty: float, warmstart: ADMMState | None = None):
-        if args.linear_model:
-            # the linear x update is closed form, so there is nothing to warmstart
-            return Linear.fit(
-                x_train,
-                y_train,
-                jnp.array(l1_penalty),
-                max_iterations=args.maxiter,
-                tol=jnp.array(args.tol),
-            )
-
-        return GaussianProcess.fit(
-            x_train,
-            y_train,
-            jnp.array(l1_penalty),
-            profile=args.profile,
-            warmstart=warmstart,
-            max_iterations=args.maxiter,
-            tol=jnp.array(args.tol),
-        )
+    build = linear_model if args.linear_model else gp_model
+    fit, predict, lambda_max = build(args, x_train, y_train)
 
     def group_norms(model: Model) -> Float[NDArray, "g"]:
         norms = jnp.sqrt(reduce(model.theta**2, "... g -> g", "sum"))
         return np.asarray(norms)
 
-    def predict(model: Model, x: Float[Array, "m d g"]) -> Float[NDArray, "m o"]:
-        if args.linear_model:
-            prediction = model.predict(x)
-        else:
-            # mock query dim: per-point 1x1 covariance instead of full m x m
-            prediction, _ = model.predict(x[:, None])
-            prediction = rearrange(prediction, "m ... 1 -> m ...")
-        return np.asarray(rearrange(prediction, "m ... -> m (...)"))
-
     def r2_scores(
         model: Model, x: Float[Array, "m d g"], y: Float[Array, "m o"]
     ) -> Float[NDArray, "o"]:
         return r2_score(np.asarray(y), predict(model, x), multioutput="raw_values")
-
-    def without_training_data(model: Model) -> Model:
-        fields = {f: None for f in ("x_train", "y_train") if f in model._fields}
-        return model._replace(**fields)
 
     def record(
         l1_penalty: float,
@@ -220,95 +223,64 @@ if __name__ == "__main__":
         print(f"    r2 (test)  = [{r2_test.min():.3f}, {r2_test.max():.3f}]")
         print(f"    r2 (train) = [{r2_train.min():.3f}, {r2_train.max():.3f}]")
 
-        results = dict(
+        row = dict(
             l1_penalty=l1_penalty,
-            model=without_training_data(model),
-            admm_state=state,
-            certificate=np.asarray(certificate),
-            group_norms=gn,
-            r2_test=r2_test,
-            r2_train=r2_train,
-            loss=loss,
             n_active=n_active,
-            state_format=STATE_FORMAT,
+            n_groups=len(gn),
+            converged=bool(state.converged(args.tol)),
+            iterations=int(state.iteration),
+            primal_residual=float(state.primal_residual),
+            dual_residual=float(state.dual_residual),
+            max_kkt=float(jnp.max(certificate)),
+            loss=float(loss),
+            group_norms=gn.tolist(),
+            r2_test=r2_test.tolist(),
+            r2_train=r2_train.tolist(),
         )
-        with open(cache_path(l1_penalty), "wb") as f:
-            pickle.dump(results, f)
-        return results
+        arrays = (
+            model_to_arrays(model)
+            | state_to_arrays(state)
+            | dict(certificate=np.asarray(certificate))
+        )
+        return store.append(row, arrays)
 
     def fit_or_load(
         l1_penalty: float, warmstart: ADMMState | None = None
     ) -> tuple[dict, ADMMState | None]:
-        cached = find_cached(l1_penalty)
-        if not args.overwrite and cached is not None:
-            with open(cached, "rb") as f:
-                results = pickle.load(f)
-            n_active = results["n_active"]
-            n_groups = len(results["group_norms"])
+        cached = None if args.overwrite else store.find(l1_penalty)
+        if cached is not None:
             print(f"lambda = {l1_penalty:.4g} (cached, resuming)")
-            print(f"    active groups = {n_active}/{n_groups}")
-            if results.get("state_format") != STATE_FORMAT:
-                print("    stale pickle (older state format), warmstarting cold")
-                return results, None
-            return results, results.get("admm_state")
-        results = record(l1_penalty, *fit(l1_penalty, warmstart=warmstart))
-        return results, results["admm_state"]
+            print(f"    active groups = {cached['n_active']}/{cached['n_groups']}")
+            return cached, store.load_state(cached["index"])
+        row = record(l1_penalty, *fit(l1_penalty, warmstart=warmstart))
+        return row, store.load_state(row["index"])
 
     path: dict[float, int] = {}
-    states: dict[float, ADMMState | None] = {}
 
-    def fit_and_track(l1_penalty: float, warmstart: ADMMState | None = None) -> dict:
+    def fit_and_track(
+        l1_penalty: float, warmstart: ADMMState | None = None
+    ) -> tuple[dict, ADMMState | None]:
         l1_penalty = float(l1_penalty)
-        results, state = fit_or_load(l1_penalty, warmstart=warmstart)
-        path[l1_penalty] = results["n_active"]
-        states[l1_penalty] = state
-        return results
+        row, state = fit_or_load(l1_penalty, warmstart=warmstart)
+        path[l1_penalty] = row["n_active"]
+        return row, state
 
-    # the unpenalized fit anchors the path and warmstarts every descent from dense
-    results = fit_and_track(0.0)
-    dense_warmstart = states[0.0]
-    gn = results["group_norms"]
-    n_groups = len(gn)
+    # the zero model anchors the path, everything above this penalty is all dead
+    start = lambda_max()
+    print(f"lambda_max = {start:.6g}")
 
-    # back off until a penalty keeps the full support alive
-    l1_penalty = LAMBDA_START_FRACTION * float(gn.max())
-    for _ in range(args.lambda_budget):
-        results = fit_and_track(l1_penalty, warmstart=dense_warmstart)
-        if results["n_active"] >= path[0.0]:
-            break
-        l1_penalty /= args.lambda_step
-    else:
-        print(f"No lambda holds the full support within {args.lambda_budget} steps.")
-
-    # climb until every group is dead, chaining warmstarts along the path
-    warmstart = states[l1_penalty]
-    for _ in range(args.lambda_budget):
-        l1_penalty *= args.lambda_step
-        results = fit_and_track(l1_penalty, warmstart=warmstart)
-        warmstart = states[l1_penalty]
-        if results["n_active"] == 0:
+    # relax geometrically from the zero model, each fit warmstarted from the last
+    warmstart, n_groups = None, None
+    for step in range(args.lambda_budget):
+        row, warmstart = fit_and_track(start * args.lambda_ratio**step, warmstart)
+        n_groups = row["n_groups"]
+        if row["n_active"] == n_groups:
             break
     else:
-        print(f"Failed to kill every group within {args.lambda_budget} lambdas.")
+        print(f"Support still incomplete after {args.lambda_budget} lambdas.")
 
-    # bisect wherever more than one group dies at once
-    for _ in range(args.lambda_refine):
-        grid = sorted(path)
-        min_width = np.log(1.001)
-        gaps = [
-            (path[lo] - path[hi], np.log(hi / lo), lo, hi)
-            for lo, hi in zip(grid, grid[1:])
-            if lo > 0 and path[lo] - path[hi] > 1 and np.log(hi / lo) > min_width
-        ]
-        if not gaps:
-            print("No lambda interval left where more than one group dies at once.")
-            break
-        lost, _, lo, hi = max(gaps)
-        midpoint = float(np.sqrt(lo * hi))
-        print(f"Refining [{lo:.4g}, {hi:.4g}], {lost} groups die there.")
-        fit_and_track(midpoint, warmstart=states[lo])
-    else:
-        print(f"Refinement budget of {args.lambda_refine} lambdas spent.")
+    # the unpenalized fit is the accuracy ceiling, and the cheapest one to reach here
+    fit_and_track(0.0, warmstart)
 
     print("Final path (lambda, active groups):")
     for l1 in sorted(path):
