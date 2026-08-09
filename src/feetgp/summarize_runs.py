@@ -1,4 +1,3 @@
-
 import glob
 import json
 import os
@@ -7,8 +6,6 @@ import re
 import sys
 
 import numpy as np
-
-from feetgp.gp import CERTIFICATE_TOLERANCE
 
 
 def read_run(run_dir):
@@ -72,7 +69,6 @@ def summarize(run_dir):
         n_with_info=len(have_info),
         kkt_median=float(np.median(kkt)) if kkt else None,
         kkt_max=float(np.max(kkt)) if kkt else None,
-        kkt_failures=sum(1 for value in kkt if value > CERTIFICATE_TOLERANCE),
         n_certified=len(kkt),
         winners={label: winners.count(label) for label in sorted(set(winners))},
         trajectory=[(round(row["l1"], 3), row["active"]) for row in rows],

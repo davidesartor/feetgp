@@ -6,9 +6,8 @@ import argparse
 import numpy as np
 from einops import rearrange
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
-
-from feetgp.gp import CERTIFICATE_TOLERANCE
 
 COLORS = [
     "#1f77b4",
@@ -26,6 +25,23 @@ COLORS = [
     "#98df8a",
 ]
 
+# same hue order, re-stepped for a dark surface
+COLORS_DARK = [
+    "#5aa9e6",
+    "#ffa14f",
+    "#5fd06a",
+    "#ff6b6b",
+    "#b18ce0",
+    "#c98f77",
+    "#f492d1",
+    "#b0b0b0",
+    "#dade4c",
+    "#45d3e8",
+    "#9fd0f0",
+    "#ffd08a",
+    "#b3e89b",
+]
+
 
 def load_run(run_dir: str) -> dict | None:
     files = glob.glob(os.path.join(run_dir, "lambda=*.pkl"))
@@ -39,19 +55,12 @@ def load_run(run_dir: str) -> dict | None:
         r2_train = (
             np.asarray(r["r2_train"]) if "r2_train" in r else np.full_like(r2, np.nan)
         )
-        info = r.get("info", {})
-        certificate = info.get("certificate")
-        if certificate is not None:
-            trusted = float(certificate["max_live_kkt"]) <= CERTIFICATE_TOLERANCE
-        else:
-            trusted = info.get("converged", True)
         results.append(
             {
                 "l1_penalty": r["l1_penalty"],
                 "group_norms": np.asarray(r["group_norms"]),
                 "r2": r2,
                 "r2_train": r2_train,
-                "trusted": trusted,
             }
         )
     results.sort(key=lambda r: r["l1_penalty"])
@@ -60,7 +69,6 @@ def load_run(run_dir: str) -> dict | None:
         "group_norms": np.stack([r["group_norms"] for r in results]),
         "r2": np.stack([r["r2"] for r in results]),
         "r2_train": np.stack([r["r2_train"] for r in results]),
-        "trusted": np.array([r["trusted"] for r in results]),
     }
 
 
@@ -92,29 +100,32 @@ def plot_run(run_dir: str, results_dir: str):
     r2_train = data["r2_train"]
     n_groups = group_norms.shape[1]
 
-    untrusted = ~data["trusted"]
-    if untrusted.any():
-        print(f"  {int(untrusted.sum())}/{len(lambdas)} lambdas failed certification")
-    marker_sizes = np.where(untrusted, 7, 0)
-    marker_style = dict(size=marker_sizes, symbol="x-thin", line=dict(width=1.5))
-
-    group_colors = [COLORS[j % len(COLORS)] for j in range(n_groups)]
+    group_colors = [COLORS_DARK[j % len(COLORS_DARK)] for j in range(n_groups)]
+    group_colors_light = [COLORS[j % len(COLORS)] for j in range(n_groups)]
 
     if target == "forces":
         r2_labels = force_labels
-        r2_colors = [COLORS[j % len(COLORS)] for j in range(len(force_labels))]
+        r2_colors = [
+            COLORS_DARK[j % len(COLORS_DARK)] for j in range(len(force_labels))
+        ]
+        r2_colors_light = [COLORS[j % len(COLORS)] for j in range(len(force_labels))]
         r2_summary = r2
         r2_train_summary = r2_train
     else:
         r2_labels = group_labels
         r2_colors = group_colors
+        r2_colors_light = group_colors_light
         r2_summary = rearrange(r2, "f (m g) -> f m g", g=group_size).mean(-1)
         r2_train_summary = rearrange(r2_train, "f (m g) -> f m g", g=group_size).mean(
             -1
         )
 
     fig = make_subplots(
-        rows=1, cols=2, subplot_titles=("Group norm per marker", "R² per output")
+        rows=1,
+        cols=2,
+        column_widths=[0.5, 0.5],
+        horizontal_spacing=0.16,
+        subplot_titles=("Group norm per marker", "R² per output"),
     )
 
     for j in range(n_groups):
@@ -122,10 +133,10 @@ def plot_run(run_dir: str, results_dir: str):
             go.Scatter(
                 x=lambdas,
                 y=group_norms[:, j],
-                mode="lines+markers",
-                marker=dict(**marker_style, color=group_colors[j]),
+                mode="lines",
                 name=group_labels[j],
-                line=dict(color=group_colors[j]),
+                line=dict(color=group_colors[j], width=2),
+                legend="legend",
                 legendgroup=group_labels[j],
                 showlegend=True,
             ),
@@ -139,10 +150,10 @@ def plot_run(run_dir: str, results_dir: str):
             go.Scatter(
                 x=lambdas,
                 y=r2_summary[:, j],
-                mode="lines+markers",
-                marker=dict(**marker_style, color=r2_colors[j]),
+                mode="lines",
                 name=r2_labels[j],
-                line=dict(color=r2_colors[j]),
+                line=dict(color=r2_colors[j], width=2),
+                legend="legend2",
                 legendgroup=r2_labels[j],
                 showlegend=True,
             ),
@@ -155,7 +166,8 @@ def plot_run(run_dir: str, results_dir: str):
                 y=r2_train_summary[:, j],
                 mode="lines",
                 name=f"{r2_labels[j]} (train)",
-                line=dict(color=r2_colors[j], dash="dot"),
+                line=dict(color=r2_colors[j], dash="dot", width=2),
+                legend="legend2",
                 legendgroup=r2_labels[j],
                 showlegend=False,
             ),
@@ -164,21 +176,45 @@ def plot_run(run_dir: str, results_dir: str):
         )
         train_trace_indices.append(len(fig.data) - 1)
 
-    fig.update_xaxes(type="log", title_text="λ")
-    fig.update_yaxes(type="log", autorange=True, title_text="group norm", row=1, col=1)
-    fig.update_yaxes(range=[-0.05, 1.05], title_text="R²", row=1, col=2)
+    dark_by_trace = group_colors + [
+        c for c in r2_colors[: r2_summary.shape[1]] for _ in range(2)
+    ]
+    light_by_trace = group_colors_light + [
+        c for c in r2_colors_light[: r2_summary.shape[1]] for _ in range(2)
+    ]
+    all_traces = list(range(len(fig.data)))
+
+    fig.update_xaxes(type="log", title_text="λ", title_standoff=8)
+    fig.update_yaxes(
+        type="log",
+        autorange=True,
+        title_text="group norm",
+        title_standoff=8,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        range=[-0.05, 1.05], title_text="R²", title_standoff=8, row=1, col=2
+    )
+    legend_style = dict(font=dict(size=10), tracegroupgap=0, yanchor="top", y=1.0)
     fig.update_layout(
-        width=1200,
-        height=500,
-        legend=dict(font=dict(size=10), tracegroupgap=0),
+        template="plotly_dark",
+        autosize=True,
+        margin=dict(l=70, r=150, t=110, b=70),
+        hovermode="x unified",
+        legend=dict(**legend_style, x=0.415, xanchor="left", title_text="marker"),
+        legend2=dict(**legend_style, x=1.02, xanchor="left", title_text="output"),
         updatemenus=[
             dict(
                 type="buttons",
                 direction="left",
-                x=1.0,
-                y=1.12,
-                xanchor="right",
+                x=0.0,
+                y=1.16,
+                xanchor="left",
                 yanchor="bottom",
+                bgcolor="#eeeeee",
+                bordercolor="#999999",
+                font=dict(color="#111111"),
                 buttons=[
                     dict(
                         label="Toggle train",
@@ -186,14 +222,37 @@ def plot_run(run_dir: str, results_dir: str):
                         args=[{"visible": "legendonly"}, train_trace_indices],
                         args2=[{"visible": True}, train_trace_indices],
                     ),
+                    dict(
+                        label="Light",
+                        method="update",
+                        args=[
+                            {"line.color": light_by_trace},
+                            {
+                                "template": pio.templates[
+                                    "plotly_white"
+                                ].to_plotly_json()
+                            },
+                            all_traces,
+                        ],
+                        args2=[
+                            {"line.color": dark_by_trace},
+                            {"template": pio.templates["plotly_dark"].to_plotly_json()},
+                            all_traces,
+                        ],
+                    ),
                 ],
-            )
+            ),
         ],
     )
 
     name = run_name_from_dir(run_dir, results_dir)
     out = os.path.join(results_dir, f"{name}.html")
-    fig.write_html(out)
+    fig.write_html(
+        out,
+        default_width="100%",
+        default_height="100vh",
+        config={"responsive": True},
+    )
     print(f"  Saved {out}")
 
 
