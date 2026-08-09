@@ -94,11 +94,15 @@ class InclineRunning:
         self.x_train = 2 * (self.x_train - x_min) / x_range - 1
         self.x_test = 2 * (self.x_test - x_min) / x_range - 1
 
-        y_mean = np.mean(self.y_train, axis=0, keepdims=True)
-        y_std = np.std(self.y_train, axis=0, keepdims=True)
-        y_std = np.where(y_std == 0, 1, y_std)
-        self.y_train = (self.y_train - y_mean) / y_std
-        self.y_test = (self.y_test - y_mean) / y_std
+        if target == "markers":
+            # markers are their own targets, so they carry the input scaling
+            self.y_train, self.y_test = self.x_train.copy(), self.x_test.copy()
+        else:
+            y_mean = np.mean(self.y_train, axis=0, keepdims=True)
+            y_std = np.std(self.y_train, axis=0, keepdims=True)
+            y_std = np.where(y_std == 0, 1, y_std)
+            self.y_train = (self.y_train - y_mean) / y_std
+            self.y_test = (self.y_test - y_mean) / y_std
 
         # consecutive columns form one group: same marker across feet and coords
         self.group_labels = [

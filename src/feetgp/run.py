@@ -14,8 +14,8 @@ from einops import rearrange, reduce
 from sklearn.metrics import r2_score
 
 from feetgp.glasso_admm import ADMMState
-from feetgp.gp import AutoregressiveGaussianProcess, GaussianProcess
-from feetgp.linear import AutoregressiveLinear, Linear
+from feetgp.gp import GaussianProcess
+from feetgp.linear import Linear
 from feetgp.inclinerunning import InclineRunning
 
 STATE_FORMAT = 9
@@ -25,7 +25,7 @@ LAMBDA_START_FRACTION = 0.02
 print("JAX devices:", jax.devices())
 
 
-Model = GaussianProcess | AutoregressiveGaussianProcess | Linear | AutoregressiveLinear
+Model = GaussianProcess | Linear
 
 
 def git_revision() -> tuple[str | None, bool]:
@@ -112,12 +112,8 @@ if __name__ == "__main__":
     x_test = jnp.asarray(data.x_test)
     n, d, g = x_train.shape
 
-    # the autoregressive fits take no targets, and score against their own inputs
-    if autoregressive:
-        y_train, y_test = (rearrange(x, "n d g -> n (d g)") for x in (x_train, x_test))
-    else:
-        y_train = jnp.asarray(data.y_train)
-        y_test = jnp.asarray(data.y_test)
+    y_train = jnp.asarray(data.y_train)
+    y_test = jnp.asarray(data.y_test)
     o = y_train.shape[1]
 
     revision, dirty = git_revision()
@@ -158,22 +154,19 @@ if __name__ == "__main__":
         return None
 
     def fit(l1_penalty: float, warmstart: ADMMState | None = None):
-        targets = () if autoregressive else (y_train,)
         if args.linear_model:
             # the linear x update is closed form, so there is nothing to warmstart
-            model_cls = AutoregressiveLinear if autoregressive else Linear
-            return model_cls.fit(
+            return Linear.fit(
                 x_train,
-                *targets,
+                y_train,
                 jnp.array(l1_penalty),
                 max_iterations=args.maxiter,
                 tol=jnp.array(args.tol),
             )
 
-        model_cls = AutoregressiveGaussianProcess if autoregressive else GaussianProcess
-        return model_cls.fit(
+        return GaussianProcess.fit(
             x_train,
-            *targets,
+            y_train,
             jnp.array(l1_penalty),
             profile=args.profile,
             warmstart=warmstart,
