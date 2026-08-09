@@ -179,17 +179,22 @@ class GaussianProcess(NamedTuple):
         x_train_flat = rearrange(x_train, "n d g -> n (d g)")
 
         # data driven bounds and init for gp mle fit with l-bfsg-b
-        theta_init, lower, upper = hetgpy_auto_bounds(x_train_flat)
-        lower = jnp.zeros_like(lower)  # allow shrink to zero
-        lower = jnp.concat([lower, jnp.log(nugget_range[0:1])])
-        upper = jnp.concat([upper, jnp.log(nugget_range[1:2])])
+        theta_init, theta_lower, theta_upper = hetgpy_auto_bounds(x_train_flat)
+        theta_lower = jnp.zeros_like(theta_lower)  # allow shrink to zero
+        to_groups = lambda v: rearrange(v, "(d g) -> d g", g=g)
+        theta_init, theta_lower, theta_upper = map(
+            to_groups, (theta_init, theta_lower, theta_upper)
+        )
+        lower = (theta_lower, jnp.log(nugget_range[0]))
+        upper = (theta_upper, jnp.log(nugget_range[1]))
 
         # negative loglikelihood for gp mle fit
         def negative_loglikelihood(
-            theta: Float[Array, "d*g"],
+            theta: Float[Array, "d g"],
             nugget: Float[Array, ""],
             y: Float[Array, "n"],
         ):
+            theta = rearrange(theta, "d g -> (d g)")
             Koo = kernel(profile, theta, x_train_flat, x_train_flat)
             Koo = Koo + nugget * jnp.eye(len(y))
             llk, b, nu = gp_loglikelihood(Koo, y)
@@ -198,42 +203,38 @@ class GaussianProcess(NamedTuple):
         # x update step, one bound constrained gp mle per output
         def x_update(state: ADMMState) -> ADMMState:
             def solve_single(
-                theta: Float[Array, "d*g"],
+                theta: Float[Array, "d g"],
                 log_nugget: Float[Array, ""],
-                theta_target: Float[Array, "d*g"],
+                theta_target: Float[Array, "d g"],
                 y: Float[Array, "n"],
-            ) -> tuple[Float[Array, "d*g"], Float[Array, ""]]:
+            ) -> tuple[Float[Array, "d g"], Float[Array, ""]]:
                 # augmented Lagrangian objective for the x update step
-                def objective(theta_and_log_nugget: Float[Array, "d*g+1"]):
-                    theta = theta_and_log_nugget[:-1]
-                    nugget = jnp.exp(theta_and_log_nugget[-1])
-                    loss, _ = negative_loglikelihood(theta, nugget, y)
+                def objective(
+                    theta_and_log_nugget: tuple[Float[Array, "d g"], Float[Array, ""]],
+                ):
+                    theta, log_nugget = theta_and_log_nugget
+                    loss, _ = negative_loglikelihood(theta, jnp.exp(log_nugget), y)
                     lagrangian = 0.5 * jnp.sum((theta - theta_target) ** 2)
                     return loss + state.rho * lagrangian
 
                 # optimize for a single output with l-bfgs-b
                 res = minimise(
                     objective,
-                    x0=jnp.concat([theta, log_nugget[None]]),
+                    x0=(theta, log_nugget),
                     bounds=(lower, upper),
                     tol=cosine_schedule(state.iteration / max_iterations),
                 )
-                theta = res.x[:-1]
-                log_nugget = res.x[-1]
+                theta, log_nugget = res.x
                 return theta, log_nugget
 
             # vectorize over outputs
-            theta = rearrange(state.x, "o d g -> o (d g)")
-            log_nugget = state.aux[0]
-            theta_target = rearrange(state.z - state.u, "o d g -> o (d g)")
             theta, log_nugget = jax.vmap(solve_single)(
-                theta, log_nugget, theta_target, y_train.T
+                state.x, state.aux[0], state.z - state.u, y_train.T
             )
-            theta = rearrange(theta, "o (d g) -> o d g", g=g)
             return state._replace(x=theta, aux=(log_nugget,))
 
         # run the ADMM solver loop, cold start unless warmstarted
-        theta0 = repeat(theta_init, "(d g) -> o d g", o=o, g=g)
+        theta0 = repeat(theta_init, "d g -> o d g", o=o)
         state = (
             warmstart.restart()
             if warmstart is not None
@@ -253,17 +254,14 @@ class GaussianProcess(NamedTuple):
         )
 
         # build the final model
-        theta = rearrange(state.z, "o d g -> o (d g)")
+        theta = state.z
         nugget = jnp.exp(state.aux[0])
         (nll, (b, nu)), grad = jax.vmap(
             jax.value_and_grad(negative_loglikelihood, has_aux=True)
         )(theta, nugget, y_train.T)
 
         # check group lasso stationarity, nugget is unpenalized so plain gradient
-        theta = rearrange(theta, "o (d g) -> o d g", g=g)
-        grad = rearrange(grad, "o (d g) -> o d g", g=g)
-        bounds = (rearrange(v[:-1], "(d g) -> d g", g=g) for v in (lower, upper))
-        certificate = kkt_certificate(theta, grad, l1_penalty, *bounds)
+        certificate = kkt_certificate(theta, grad, l1_penalty, theta_lower, theta_upper)
 
         model = cls(profile, theta, nugget, b, nu, x_train, y_train)
         return model, nll.sum(), state, certificate
@@ -337,17 +335,22 @@ class AutoregressiveGaussianProcess(NamedTuple):
         y_train = rearrange(x_train, "n do go -> do go n")
 
         # data driven bounds and init for gp mle fit with l-bfsg-b
-        theta_init, lower, upper = hetgpy_auto_bounds(x_train_flat)
-        lower = jnp.zeros_like(lower)  # allow shrink to zero
-        lower = jnp.concat([lower, jnp.log(nugget_range[0:1])])
-        upper = jnp.concat([upper, jnp.log(nugget_range[1:2])])
+        theta_init, theta_lower, theta_upper = hetgpy_auto_bounds(x_train_flat)
+        theta_lower = jnp.zeros_like(theta_lower)  # allow shrink to zero
+        to_groups = lambda v: rearrange(v, "(di gi) -> di gi", gi=g)
+        theta_init, theta_lower, theta_upper = map(
+            to_groups, (theta_init, theta_lower, theta_upper)
+        )
+        lower = (theta_lower, jnp.log(nugget_range[0]))
+        upper = (theta_upper, jnp.log(nugget_range[1]))
 
         # negative loglikelihood for gp mle fit
         def negative_loglikelihood(
-            theta: Float[Array, "di*gi"],
+            theta: Float[Array, "di gi"],
             nugget: Float[Array, ""],
             y: Float[Array, "n"],
         ):
+            theta = rearrange(theta, "di gi -> (di gi)")
             Koo = kernel(profile, theta, x_train_flat, x_train_flat)
             Koo = Koo + nugget * jnp.eye(len(y))
             llk, b, nu = gp_loglikelihood(Koo, y)
@@ -356,42 +359,40 @@ class AutoregressiveGaussianProcess(NamedTuple):
         # x update step, one bound constrained gp mle per output
         def x_update(state: ADMMState) -> ADMMState:
             def solve_single(
-                theta: Float[Array, "di*gi"],
+                theta: Float[Array, "di gi"],
                 log_nugget: Float[Array, ""],
-                theta_target: Float[Array, "di*gi"],
+                theta_target: Float[Array, "di gi"],
                 y: Float[Array, "n"],
-            ) -> tuple[Float[Array, "di*gi"], Float[Array, ""]]:
+            ) -> tuple[Float[Array, "di gi"], Float[Array, ""]]:
                 # augmented Lagrangian objective for the x update step
-                def objective(theta_and_log_nugget: Float[Array, "di*gi+1"]):
-                    theta = theta_and_log_nugget[:-1]
-                    nugget = jnp.exp(theta_and_log_nugget[-1])
-                    loss, _ = negative_loglikelihood(theta, nugget, y)
+                def objective(
+                    theta_and_log_nugget: tuple[
+                        Float[Array, "di gi"], Float[Array, ""]
+                    ],
+                ):
+                    theta, log_nugget = theta_and_log_nugget
+                    loss, _ = negative_loglikelihood(theta, jnp.exp(log_nugget), y)
                     lagrangian = 0.5 * jnp.sum((theta - theta_target) ** 2)
                     return loss + state.rho * lagrangian
 
                 # optimize for a single output with l-bfgs-b
                 res = minimise(
                     objective,
-                    x0=jnp.concat([theta, log_nugget[None]]),
+                    x0=(theta, log_nugget),
                     bounds=(lower, upper),
                     tol=cosine_schedule(state.iteration / max_iterations),
                 )
-                theta = res.x[:-1]
-                log_nugget = res.x[-1]
+                theta, log_nugget = res.x
                 return theta, log_nugget
 
             # vectorize over both output axes
-            theta = rearrange(state.x, "do go di gi -> do go (di gi)")
-            log_nugget = state.aux[0]
-            theta_target = rearrange(state.z - state.u, "do go di gi -> do go (di gi)")
             theta, log_nugget = jax.vmap(jax.vmap(solve_single))(
-                theta, log_nugget, theta_target, y_train
+                state.x, state.aux[0], state.z - state.u, y_train
             )
-            theta = rearrange(theta, "do go (di gi) -> do go di gi", gi=g)
             return state._replace(x=theta, aux=(log_nugget,))
 
         # run the ADMM solver loop, cold start unless warmstarted
-        theta0 = repeat(theta_init, "(di gi) -> do go di gi", do=d, go=g, gi=g)
+        theta0 = repeat(theta_init, "di gi -> do go di gi", do=d, go=g)
         state = (
             warmstart.restart()
             if warmstart is not None
@@ -411,7 +412,7 @@ class AutoregressiveGaussianProcess(NamedTuple):
         )
 
         # build the final model
-        theta = rearrange(state.z, "do go di gi -> do go (di gi)")
+        theta = state.z
         nugget = jnp.exp(state.aux[0])
         value_and_grad = jax.value_and_grad(negative_loglikelihood, has_aux=True)
         (nll, (b, nu)), grad = jax.vmap(jax.vmap(value_and_grad))(
@@ -419,10 +420,7 @@ class AutoregressiveGaussianProcess(NamedTuple):
         )
 
         # check group lasso stationarity, nugget is unpenalized so plain gradient
-        theta = rearrange(theta, "do go (di gi) -> do go di gi", gi=g)
-        grad = rearrange(grad, "do go (di gi) -> do go di gi", gi=g)
-        bounds = (rearrange(v[:-1], "(di gi) -> di gi", gi=g) for v in (lower, upper))
-        certificate = kkt_certificate(theta, grad, l1_penalty, *bounds)
+        certificate = kkt_certificate(theta, grad, l1_penalty, theta_lower, theta_upper)
 
         model = cls(profile, theta, nugget, b, nu, x_train)
         return model, nll.sum(), state, certificate
