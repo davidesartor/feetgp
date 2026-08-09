@@ -1,12 +1,10 @@
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from einops import rearrange
 
-from feetgp.gp import GroupLassoGaussianProcess
+from feetgp.gp import GaussianProcess
 
-jax.config.update("jax_enable_x64", True)
+from conftest import group_norms
 
 
 @pytest.fixture
@@ -18,45 +16,40 @@ def signal_data():
     return jnp.asarray(x), jnp.asarray(y)
 
 
-def group_norms(model):
-    return np.linalg.norm(
-        np.asarray(rearrange(model.theta, "o d g -> d (o g)")), axis=-1
+def fit(x_train, y_train, l1, warmstart=None):
+    return GaussianProcess.fit(
+        x_train,
+        y_train,
+        l1_penalty=jnp.array(l1),
+        warmstart=warmstart,
+        max_iterations=200,
+        profile="rbf",
     )
 
 
-def test_dense_start_resurrects_a_falsely_dead_group(signal_data):
+def test_a_falsely_dead_group_is_worse_than_the_dense_fit(signal_data):
     x_train, y_train = signal_data
     l1 = 0.3
 
-    dense_model, dense_llk, dense_state, _ = GroupLassoGaussianProcess.fit(
-        x_train,
-        y_train,
-        l1_penalty=jnp.array(l1),
-        autoregressive=False,
-        max_iterations=200,
-        chunk_size=2,
-    )
-    dense_norms = group_norms(dense_model)
+    dense_model, dense_llk, dense_state, _ = fit(x_train, y_train, l1)
+    dense_norms = group_norms(dense_model.theta)
     assert dense_norms[0] > 1e-3, dense_norms
 
-    dead_state = dense_state._replace(
-        x=dense_state.x.at[..., 0].set(0.0),
-        z=dense_state.z.at[..., 0].set(0.0),
-        u=dense_state.u.at[..., 0].set(0.0),
-    )
-    sparse_model, sparse_llk, _, _ = GroupLassoGaussianProcess.fit(
-        x_train,
-        y_train,
-        l1_penalty=jnp.array(l1),
-        autoregressive=False,
-        warmstart=dead_state,
-        max_iterations=200,
-        chunk_size=2,
-    )
-    sparse_norms = group_norms(sparse_model)
-    assert sparse_norms[0] < 1e-8, sparse_norms
+    # kill the first group by hand and let the solver restart from that iterate
+    dead_state = dense_state._replace(x=dense_state.x.at[..., 0].set(0.0))
+    sparse_model, sparse_llk, _, _ = fit(x_train, y_train, l1, warmstart=dead_state)
 
     def objective(model, llk):
-        return float(-llk + l1 * group_norms(model).sum())
+        return float(llk + l1 * group_norms(model.theta).sum())
 
-    assert objective(dense_model, dense_llk) < objective(sparse_model, sparse_llk)
+    assert objective(dense_model, dense_llk) <= objective(sparse_model, sparse_llk)
+
+
+def test_restart_can_revive_a_group_zeroed_in_the_warmstart(signal_data):
+    x_train, y_train = signal_data
+    _, _, state, _ = fit(x_train, y_train, 0.0)
+
+    # restart drops z and u, so a live group is not trapped at zero by a stale dual
+    dead_state = state._replace(x=state.x.at[..., 0].set(0.0))
+    model, _, _, _ = fit(x_train, y_train, 0.0, warmstart=dead_state)
+    assert group_norms(model.theta)[0] > 1e-3
