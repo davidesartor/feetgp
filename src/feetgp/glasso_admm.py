@@ -6,130 +6,108 @@ import jax.numpy as jnp
 import equinox as eqx
 from einops import reduce
 
-RHO_MIN, RHO_MAX = 1e-6, 1e6
+RHO_MIN, RHO_MAX = 1e-4, 1e4
 
 
 class ADMMState(NamedTuple):
     x: Float[Array, "... g"]
     z: Float[Array, "... g"]
     u: Float[Array, "... g"]
-    rho: Float[Array, ""]
-    aux: Any = None
+    rho: Float[Array, ""] = jnp.array(1.0)
+    iteration: Int[Array, ""] = jnp.array(0)
+    primal_residual: Float[Array, ""] = jnp.array(jnp.inf)
+    dual_residual: Float[Array, ""] = jnp.array(jnp.inf)
+    aux: tuple[Any, ...] = ()
+
+    def converged(self, tol: Float[Array, ""]) -> Bool[Array, ""]:
+        """Both residuals are relative, so one tolerance covers them."""
+        return (self.primal_residual <= tol) & (self.dual_residual <= tol)
 
 
 UpdateX = Callable[[ADMMState], ADMMState]
-
-
-def kkt_certificate(
-    grad: Float[Array, "... g"],
-    theta: Float[Array, "... g"],
-    l1: Float[Array, ""],
-    bounds: Optional[Float[Array, "2 ... g"]] = None,
-) -> dict:
-    """Check the group lasso KKT conditions given the smooth-loss gradient."""
-    # stationarity of live groups: gradient plus the penalty subgradient
-    norms = jnp.sqrt(reduce(theta**2, "... g -> g", "sum"))
-    live = norms > 0.0
-    stationarity = grad + l1 * theta / jnp.where(live, norms, 1.0)
-
-    # project out components blocked by the box constraints
-    if bounds is not None:
-        lower, upper = bounds
-        stationarity = jnp.where(
-            theta <= lower, jnp.minimum(stationarity, 0.0), stationarity
-        )
-        stationarity = jnp.where(
-            theta >= upper, jnp.maximum(stationarity, 0.0), stationarity
-        )
-
-    # dead groups only need their gradient inside the penalty ball
-    live_kkt = jnp.sqrt(reduce(stationarity**2, "... g -> g", "sum"))
-    dead_slack = l1 - jnp.sqrt(reduce(grad**2, "... g -> g", "sum"))
-    return dict(
-        max_live_kkt=jnp.max(jnp.where(live, live_kkt, 0.0)),
-        live_kkt=jnp.where(live, live_kkt, jnp.nan),
-        dead_slack=jnp.where(live, jnp.nan, dead_slack),
-    )
 
 
 @eqx.filter_jit
 def update_z_and_u(state: ADMMState, l1_penalty: Float[Array, ""]) -> ADMMState:
     # compute the group lasso proximal operator
     v = state.x + state.u
-    threshold = l1_penalty / state.rho
     norm = jnp.sqrt(reduce(v**2, "... g -> g", "sum"))
-    norm = jnp.maximum(norm, 0.5 * threshold)  # avoid division by zero
-    z = jnp.maximum(0.0, 1 - threshold / norm) * v
+    z = v * (1 - l1_penalty / state.rho / norm).clip(min=0.0, max=1.0)
     return state._replace(z=z, u=state.u + state.x - z)
 
 
 @eqx.filter_jit
-def check_residuals(
-    state: ADMMState,
-    prev: ADMMState,
-    tol: Float[Array, ""],
-    update_rho: Bool[Array, ""],
-) -> tuple[ADMMState, Bool[Array, ""], Bool[Array, ""]]:
-    # check primal residual: ||x - z||_2 < eps_abs + tol * max(||x||_2, ||z||_2)
-    primal_residual = jnp.linalg.norm(state.x - state.z)
-    primal_target = jnp.maximum(jnp.linalg.norm(prev.x), jnp.linalg.norm(prev.z))
-    primal_ok = primal_residual <= tol * primal_target
+def update_residuals(state: ADMMState, prev: ADMMState) -> ADMMState:
+    # primal residual ||x - z||_2, relative to max(||x||_2, ||z||_2)
+    primal = jnp.linalg.norm(state.x - state.z)
+    primal_target = jnp.maximum(jnp.linalg.norm(state.x), jnp.linalg.norm(state.z))
 
-    # check dual residual: ||rho * (z - z_prev)||_2 < eps_abs + tol * ||rho * u||_2
-    dual_residual = state.rho * jnp.linalg.norm(state.z - prev.z)
-    dual_target = state.rho * jnp.linalg.norm(prev.u)
-    dual_ok = dual_residual <= tol * dual_target
+    # dual residual ||rho (z - z_prev)||_2, relative to ||rho u||_2
+    dual = state.rho * jnp.linalg.norm(state.z - prev.z)
+    dual_target = state.rho * jnp.linalg.norm(state.u)
 
+    # a zero target leaves the ratio at inf, or at zero when the residual vanishes
+    return state._replace(
+        iteration=state.iteration + 1,
+        primal_residual=jnp.nan_to_num(primal / primal_target),
+        dual_residual=jnp.nan_to_num(dual / dual_target),
+    )
+
+
+@eqx.filter_jit
+def update_rho(state: ADMMState, adapt: Bool[Array, ""]) -> ADMMState:
     # adapt rho if the primal and dual residuals are very different
-    increase = (primal_residual > 10 * dual_residual) & update_rho
-    decrease = (dual_residual > 10 * primal_residual) & update_rho
+    increase = (state.primal_residual > 10 * state.dual_residual) & adapt
+    decrease = (state.dual_residual > 10 * state.primal_residual) & adapt
     scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
     new_rho = jnp.clip(state.rho * scale, RHO_MIN, RHO_MAX)
-    state = state._replace(rho=new_rho, u=state.u * (state.rho / new_rho))
-    return state, primal_ok, dual_ok
+    return state._replace(rho=new_rho, u=state.u * (state.rho / new_rho))
 
 
+@eqx.filter_jit
 def solve(
     x_update: UpdateX,
-    x0: Float[Array, "... g"],
-    aux: Any = None,
-    l1_penalty: Float[Array, ""] = jnp.array(0.0),
+    state: ADMMState,
+    l1_penalty: Float[Array, ""],
     *,
-    z0: Optional[Float[Array, "... g"]] = None,
-    u0: Optional[Float[Array, "... g"]] = None,
-    rho0: Float[Array, ""] = jnp.array(1.0),
-    max_iterations: int | Int[Array, ""] = 300,
-    tol: float | Float[Array, ""] = 1e-3,
-    adapt_rho: bool | Bool[Array, ""] = True,
-) -> tuple[ADMMState, Bool[Array, ""], Int[Array, ""]]:
-    # initialize while loop state
-    z0 = z0 if z0 is not None else x0
-    u0 = u0 if u0 is not None else jnp.zeros_like(x0)
-    state = ADMMState(x=x0, z=z0, u=u0, rho=rho0, aux=aux)
-    converged = jnp.asarray(False)
-    iter = jnp.asarray(0)
-
+    max_iterations: int | Int[Array, ""] = jnp.array(300),
+    tol: float | Float[Array, ""] = jnp.array(1e-3),
+    adapt_rho: bool | Bool[Array, ""] = jnp.array(True),
+) -> ADMMState:
     # define admm loop condition and body
-    def while_condition(carry):
-        state, converged, iter = carry
-        return (iter < max_iterations) & (~converged)
+    def while_condition(state: ADMMState) -> Bool[Array, ""]:
+        return (state.iteration < max_iterations) & ~state.converged(jnp.asarray(tol))
 
-    def while_body(
-        carry: tuple[ADMMState, Bool[Array, ""], Int[Array, ""]],
-    ) -> tuple[ADMMState, Bool[Array, ""], Int[Array, ""]]:
-        state, converged, iter = carry
+    def while_body(state: ADMMState) -> ADMMState:
         new_state = x_update(state)
         new_state = update_z_and_u(new_state, l1_penalty)
-        update_rho = jnp.asarray(adapt_rho & (iter < max_iterations // 2))
-        new_state, primal_ok, dual_ok = check_residuals(
-            new_state, state, jnp.asarray(tol), update_rho=update_rho
-        )
-
-        converged = primal_ok.all() & dual_ok.all()
-        return new_state, converged, iter + 1
+        new_state = update_residuals(new_state, state)
+        adapt = jnp.asarray(adapt_rho & (state.iteration < max_iterations // 2))
+        return update_rho(new_state, adapt)
 
     # run the admm optimization loop
-    state, converged, iter = jax.lax.while_loop(
-        while_condition, while_body, (state, converged, iter)
-    )
-    return state, converged, iter
+    return jax.lax.while_loop(while_condition, while_body, state)
+
+
+@eqx.filter_jit
+def kkt_certificate(
+    x: Float[Array, "... g"],
+    grad: Float[Array, "... g"],
+    l1_penalty: Float[Array, ""],
+    lower_bound: Optional[Float[Array, "... g"]] = None,
+    upper_bound: Optional[Float[Array, "... g"]] = None,
+) -> Float[Array, "g"]:
+    # kkt of live groups: gradient plus the penalty subgradient
+    norms = jnp.sqrt(reduce(x**2, "... g -> g", "sum"))
+    kkt = grad + l1_penalty * x / jnp.where(norms > 0.0, norms, 1.0)
+
+    # project out components blocked by the box constraints
+    if lower_bound is not None:
+        kkt = jnp.where(x <= lower_bound, kkt.clip(max=0.0), kkt)
+    if upper_bound is not None:
+        kkt = jnp.where(x >= upper_bound, kkt.clip(min=0.0), kkt)
+
+    # dead groups only need their gradient inside the penalty ball
+    kkt = jnp.sqrt(reduce(kkt**2, "... g -> g", "sum"))
+    dead_slack = l1_penalty - jnp.sqrt(reduce(grad**2, "... g -> g", "sum"))
+    return jnp.where(norms > 0.0, kkt, -dead_slack)

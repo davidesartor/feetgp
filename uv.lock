@@ -306,7 +306,7 @@ requires-dist = [
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "jax", extras = ["cuda"], specifier = ">=0.9.0.1" },
     { name = "jaxtyping", specifier = ">=0.3.7" },
-    { name = "jaxvlse", specifier = ">=0.1.1" },
+    { name = "jaxvlse", specifier = ">=0.1.2" },
     { name = "joblib", specifier = ">=1.5.3" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "nbformat", specifier = ">=5.10.4" },
@@ -542,16 +542,16 @@ wheels = [
 
 [[package]]
 name = "jaxvlse"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "equinox" },
     { name = "jax" },
     { name = "jaxtyping" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/87/b8b68a4beac57a08d12108d8ecc87bd3f305c5cdaf69c326a03bfdd05e26/jaxvlse-0.1.1.tar.gz", hash = "sha256:3f2655b71d1a88aead37c587c7efa521750c7cb2b9b4cae678e0e9f713547ddb", size = 30494, upload-time = "2026-08-06T20:39:48.087Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/84/52/67d0fdcda24700d1c4f2a32c12c9a7812946ac28bd7b90c7ddd5d3379e16/jaxvlse-0.1.2.tar.gz", hash = "sha256:017856050fe529a1a4b85d125fff7fe7fa2f3a7b115b3b0d49112b7f13a94a8e", size = 30544, upload-time = "2026-08-08T23:22:02.706Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/41/6f/a6d6a1f9f6eddcf0602932188a1361060761a2bbaeebb1903e933b947387/jaxvlse-0.1.1-py3-none-any.whl", hash = "sha256:4bf60ab8297853ee7bbdd87d3371d1d5b722ff4ecf3d8c574e888d6b980c0360", size = 33892, upload-time = "2026-08-06T20:39:48.992Z" },
+    { url = "https://files.pythonhosted.org/packages/38/fa/ceb8f0936c99e9b513c341c9b8b487be500e5b03b63611bdda248971777d/jaxvlse-0.1.2-py3-none-any.whl", hash = "sha256:f1688a6e1234a945c604163738393b0a5217bca4932bd1c2c0d6299f168f810d", size = 33902, upload-time = "2026-08-08T23:22:01.796Z" },
 ]
 
 [[package]]

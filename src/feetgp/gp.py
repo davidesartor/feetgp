@@ -1,31 +1,17 @@
-from typing import NamedTuple, Optional, Self
-from jaxtyping import Array, Bool, Float, Int
+from typing import NamedTuple, Self
+from jaxtyping import Array, Int, Float
 
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import equinox as eqx
-
 from einops import rearrange, repeat, pack, unpack
-import numpy as np
 from vlse.optim import minimise
-from feetgp import glasso_admm
-from feetgp.glasso_admm import ADMMState, solve
+
+from feetgp.glasso_admm import ADMMState, solve, kkt_certificate
 
 # fp64 is a must otherwise cholesky fails badly
 jax.config.update("jax_enable_x64", True)
-
-
-CERTIFICATE_TOLERANCE = 1e-2
-
-
-def squared_distance(
-    x1: Float[Array, "n d"], x2: Float[Array, "m d"]
-) -> Float[Array, "n m"]:
-    # fast pairwise squared distances expanding the square
-    sqn1 = jnp.sum(x1**2, axis=-1)
-    sqn2 = jnp.sum(x2**2, axis=-1)
-    return sqn1[:, None] + sqn2[None, :] - 2.0 * x1 @ x2.T
 
 
 def kernel(
@@ -33,8 +19,10 @@ def kernel(
     x1: Float[Array, "n d"],
     x2: Float[Array, "m d"],
 ) -> Float[Array, "n m"]:
-    # squared exponential kernel with ARD lengthscales
-    d2 = squared_distance(x1 * theta, x2 * theta)
+    # squared exponential ARD kernel, exponent linear in the precisions theta
+    sqn1 = jnp.sum(theta * x1**2, axis=-1)
+    sqn2 = jnp.sum(theta * x2**2, axis=-1)
+    d2 = sqn1[:, None] + sqn2[None, :] - 2.0 * (theta * x1) @ x2.T
     return jnp.exp(-0.5 * d2)
 
 
@@ -42,7 +30,7 @@ def hetgpy_auto_bounds(
     x: Float[Array, "n d"],
     min_cor: float = 0.01,
     max_cor: float = 0.5,
-) -> tuple[Float[Array, "d"], Float[Array, "d"]]:
+) -> tuple[Float[Array, "d"], Float[Array, "d"], Float[Array, "d"]]:
     # normalize each column to [0, 1] so distances are comparable
     x_min, x_max = x.min(axis=0), x.max(axis=0)
     x_span = jnp.where(x_max > x_min, x_max - x_min, 1.0)
@@ -50,14 +38,26 @@ def hetgpy_auto_bounds(
 
     # pairwise squared distances between distinct points
     rows, cols = jnp.tril_indices(len(x), k=-1)
-    dists = squared_distance(x, x)
-    dists = jnp.maximum(dists[rows, cols], 0.0)
+    dists = jnp.sum((x[rows] - x[cols]) ** 2, axis=-1)
+    dists = jnp.maximum(dists, 0.0)
     dists = jnp.where(dists > 0, dists, jnp.nan)
 
     # lengthscale bounds from target correlations at distance quantiles
-    lower = -jnp.nanquantile(dists, 0.05) / jnp.log(min_cor) * x_span**2
-    upper = -jnp.nanquantile(dists, 0.95) / jnp.log(max_cor) * x_span**2
-    return lower, upper
+    lower = -0.5 * jnp.nanquantile(dists, 0.05) / jnp.log(min_cor) * x_span**2
+    upper = -0.5 * jnp.nanquantile(dists, 0.95) / jnp.log(max_cor) * x_span**2
+    init = 0.9 * upper + 0.1 * lower
+
+    # invert into the precision parametrization
+    init, lower, upper = 1.0 / init, 1.0 / upper, 1.0 / lower
+    return init, lower, upper
+
+
+def cosine_schedule(
+    t: Float[Array, ""], min: float = 1e-4, max: float = 1e-1
+) -> Float[Array, ""]:
+    """Anneal from maximum to minimum over t in [0, 1], flat at both ends."""
+    t = 0.5 * (1.0 + jnp.cos(jnp.pi * t.clip(0.0, 1.0)))
+    return jnp.exp(jnp.log(min) + (jnp.log(max) - jnp.log(min)) * t)
 
 
 def gp_posterior(
@@ -101,54 +101,7 @@ def gp_loglikelihood(
     return (loglik, b, nu)
 
 
-def autoregressive_mask(o: int, d: int, group_size: int) -> Float[Array, "o d"]:
-    # zero out each output's own input group
-    return (jnp.arange(o)[:, None] // group_size != jnp.arange(d)[None, :]).astype(
-        float
-    )
-
-
-@eqx.filter_jit
-def kkt_certificate(
-    theta: Float[Array, "o d g"],
-    w: Float[Array, "o"],
-    l1: Float[Array, ""],
-    x_train: Float[Array, "n d g"],
-    y_train: Float[Array, "n o"],
-    bounds: Float[Array, "2 d o*g"],
-    mask: Optional[Float[Array, "o d"]] = None,
-    chunk_size: int = 8,
-) -> dict:
-    n, _, group_size = x_train.shape
-    design = rearrange(x_train, "n d g -> n (d g)")
-
-    def negloglik_single_output(
-        theta_i: Float[Array, "d*g"], w_i: Float[Array, ""], y_i: Float[Array, "n"]
-    ) -> Float[Array, ""]:
-        Koo = kernel(theta_i, design, design) + jnp.exp(w_i) * jnp.eye(n)
-        loglik, _, _ = gp_loglikelihood(Koo, y_i)
-        return -loglik
-
-    # per-output gradients of the negative log likelihood
-    grad_theta, grad_w = jax.lax.map(
-        lambda inputs: jax.grad(negloglik_single_output, argnums=(0, 1))(*inputs),
-        (rearrange(theta, "o d g -> o (d g)"), w, y_train.T),
-        batch_size=chunk_size,
-    )
-    if mask is not None:
-        grad_theta = grad_theta * repeat(mask, "o d -> o (d g)", g=group_size)
-
-    # check group lasso stationarity, nugget is unpenalized so plain gradient
-    certificate = glasso_admm.kkt_certificate(
-        rearrange(grad_theta, "o (d g) -> o g d", g=group_size),
-        rearrange(theta, "o d g -> o g d"),
-        l1,
-        rearrange(bounds, "b d (o g) -> b o g d", g=group_size),
-    )
-    return certificate | dict(nugget_grad=jnp.max(jnp.abs(grad_w)))
-
-
-class GroupLassoGaussianProcess(NamedTuple):
+class GaussianProcess(NamedTuple):
     theta: Float[Array, "o d g"]
     nugget: Float[Array, "o"]
     b: Float[Array, "o"]
@@ -171,223 +124,274 @@ class GroupLassoGaussianProcess(NamedTuple):
             x_train: Float[Array, "n d g"],
             y_train: Float[Array, "n"],
         ) -> tuple[Float[Array, "m"], Float[Array, "m m"]]:
-            x_train = rearrange(self.x_train, "n d g -> n (d g)")
+            # flatten the group dimension for the kernel computations
+            x = rearrange(x, "m d g -> m (d g)")
+            theta = rearrange(theta, "d g -> (d g)")
+            x_train = rearrange(x_train, "n d g -> n (d g)")
+
+            # compute the kernel matrices
             Kox = nu * kernel(theta, x_train, x)
-            Koo = nu * (
-                kernel(theta, x_train, x_train) + nugget * jnp.eye(len(y_train))
-            )
+            Koo = nu * (kernel(theta, x_train, x_train))
+            Koo = Koo + nugget * jnp.eye(len(y_train))
             Kxx = nu * kernel(theta, x, x)
             return gp_posterior(Kxx, Kox, Koo, y_train, b)
 
-        # vectorize over outputs, scan over inputs to avoid OOM
-        *b, m, d, g = x.shape
-        x = rearrange(x, "... m d g -> b m (d g)")
+        # vectorize over outputs, scan over batch axes to avoid OOM
+        x, batch = pack([x], "* m d g")
         predict = jax.vmap(predict_single, in_axes=(None, 0, 0, 0, 0, None, 1))
         mean, cov = jax.lax.map(lambda x: predict(x, *self), x)
-        mean = mean.reshape(*b, *mean.shape[1:])
-        cov = cov.reshape(*b, *cov.shape[1:])
+        [mean] = unpack(mean, batch, "* o m")
+        [cov] = unpack(cov, batch, "* o m1 m2")
         return mean, cov
 
     @classmethod
     @eqx.filter_jit
-    def unpack_parameters(
-        cls,
-        admm_theta: Float[Array, "o d g"],
-        admm_w: Float[Array, "o"],
-        x_train: Float[Array, "n d g"],
-        y_train: Float[Array, "n o"],
-    ) -> tuple[Self, Float[Array, ""]]:
-        theta = jnp.abs(admm_theta)
-        nugget = jnp.exp(admm_w)
-        design = rearrange(x_train, "n d g -> n (d g)")
-
-        def unpack_single_output(
-            theta_i: Float[Array, "d*g"],
-            nugget_i: Float[Array, ""],
-            y_i: Float[Array, "n"],
-        ) -> tuple[Float[Array, ""], Float[Array, ""], Float[Array, ""]]:
-            Koo = kernel(theta_i, design, design) + nugget_i * jnp.eye(len(y_i))
-            return gp_loglikelihood(Koo, y_i)
-
-        # recover the profiled trend and variance for each output
-        _, (llk, b, nu) = jax.lax.scan(
-            lambda _, args: (_, unpack_single_output(*args)),
-            None,
-            (rearrange(theta, "o d g -> o (d g)"), nugget, y_train.T),
-        )
-        self = cls(theta, nugget, b, nu, x_train, y_train)
-        return self, llk.sum()
-
-    @classmethod
-    def fit(cls, *args, **kwargs) -> tuple[Self, Float[Array, ""], ADMMState, dict]:
-        """Fit and move the solver diagnostics off device."""
-        self, llk, state, converged, iterations, certificate = cls._fit(*args, **kwargs)
-        info = dict(
-            converged=bool(converged),
-            iterations=int(iterations),
-            certificate={k: np.asarray(v) for k, v in certificate.items()},
-        )
-        return self, llk, state, info
-
-    @classmethod
-    @eqx.filter_jit
-    def _fit(
+    def fit(
         cls,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
         l1_penalty: Float[Array, ""],
-        autoregressive: bool = True,
         *,
-        warmstart: Optional["Self | ADMMState"] = None,
-        nugget_init: float = 0.1,
-        max_iterations: int = 300,
-        tol: Float[Array, ""] = jnp.array(1e-3),
-        adapt_rho: bool = True,
-        inner_maxiter: int = 5,
-        inner_pgtol: float = 1e-2,
-        inner_max_linesearch: int = 5,
-        chunk_size: int = 8,
-        history_length: int = 40,
-        **_,
-    ) -> tuple[
-        Self, Float[Array, ""], ADMMState, Bool[Array, ""], Int[Array, ""], dict
-    ]:
-        _, d, group_size = x_train.shape
+        nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
+        max_iterations: int | Int[Array, ""] = jnp.array(300),
+        **kwargs,
+    ) -> tuple[Self, Float[Array, ""], ADMMState, Float[Array, "g"]]:
+        _, d, g = x_train.shape
         _, o = y_train.shape
-        design = rearrange(x_train, "n d g -> n (d g)")
+        x_train_flat = rearrange(x_train, "n d g -> n (d g)")
 
-        # box constraints for theta and the free nugget parameter
-        lower, upper = (
-            rearrange(bound, "(d g) -> d g", g=group_size)
-            for bound in hetgpy_auto_bounds(design)
-        )
-        theta_max = repeat(jnp.sqrt(2.0 / lower), "d g -> d (o g)", o=o)
-        bounds = jnp.stack([jnp.zeros_like(theta_max), theta_max], axis=0)
-        admm_bounds = rearrange(bounds, "b d (o g) -> b o g d", o=o)
-        w_min, w_max = (jnp.full((o, 1), jnp.log(g)) for g in (1e-4, 100.0))
-        solver_lower = jnp.concat([jnp.zeros((o, d * group_size)), w_min], axis=-1)
-        solver_upper = jnp.concat(
-            [repeat(jnp.sqrt(2.0 / lower), "d g -> o (d g)", o=o), w_max], axis=-1
-        )
+        # data driven bounds and init for gp mle fit with l-bfsg-b
+        theta_init, lower, upper = hetgpy_auto_bounds(x_train_flat)
+        lower = jnp.zeros_like(lower)  # allow shrink to zero
+        lower = jnp.concat([lower, jnp.log(nugget_range[0:1])])
+        upper = jnp.concat([upper, jnp.log(nugget_range[1:2])])
 
-        # initialize near the long-lengthscale end of the box
-        theta_init = repeat(
-            jnp.sqrt(2.0 / (0.9 * upper + 0.1 * lower)), "d g -> o g d", o=o
-        )
-        w_init = jnp.full((o,), jnp.log(nugget_init))
+        # negative loglikelihood for gp mle fit
+        def negative_loglikelihood(
+            theta: Float[Array, "d*g"],
+            nugget: Float[Array, ""],
+            y: Float[Array, "n"],
+        ):
+            Koo = kernel(theta, x_train_flat, x_train_flat)
+            Koo = Koo + nugget * jnp.eye(len(y))
+            llk, b, nu = gp_loglikelihood(Koo, y)
+            return -llk, (b, nu)
 
-        # take the starting point from the warmstart when given
-        start = ADMMState(
-            x=theta_init,
-            z=theta_init,
-            u=jnp.zeros_like(theta_init),
-            rho=jnp.array(1.0),
-            aux=w_init,
-        )
-        if isinstance(warmstart, ADMMState):
-            start = warmstart
-        elif warmstart is not None:
-            theta = rearrange(warmstart.theta, "o d g -> o g d")
-            w = jnp.log(warmstart.nugget)
-            start = start._replace(x=theta, z=theta, aux=w)
-
-        # autoregressive outputs never see their own input group
-        if autoregressive:
-            keep = repeat(1.0 - jnp.eye(d), "k d -> k (d g)", g=group_size)
-            masked_designs = design[None, :, :] * keep[:, None, :]
-            mask = autoregressive_mask(o, d, group_size)
-            flat_mask = jnp.concat(
-                [repeat(mask, "o d -> o (d g)", g=group_size), jnp.ones((o, 1))],
-                axis=-1,
-            )
-        else:
-            masked_designs = jnp.broadcast_to(design, (d, *design.shape))
-            mask = None
-            flat_mask = jnp.ones((o, d * group_size + 1))
-
-        group_of_output = jnp.arange(o) // group_size
-
-        # solve each output's bounded likelihood subproblem with L-BFGS-B
-        def x_update_loss(x: Float[Array, "d*g+1"], args: tuple) -> Float[Array, ""]:
-            # negative log likelihood plus the augmented lagrangian penalty
-            target_theta, rho, design, ys = args
-            theta, w = x[:-1], x[-1]
-            Koo = kernel(jax.nn.relu(theta), design, design)
-            Koo = Koo + jnp.exp(w) * jnp.eye(len(ys))
-            loglik, _, _ = gp_loglikelihood(Koo, ys)
-            lagrangian = 0.5 * rho * jnp.sum((theta - target_theta) ** 2)
-            return -loglik + lagrangian
-
+        # x update step, one bound constrained gp mle per output
         def x_update(state: ADMMState) -> ADMMState:
-            def solve_one(
-                x_i: Float[Array, "g d"],
-                w_i: Float[Array, ""],
-                target_i: Float[Array, "g d"],
-                y_i: Float[Array, "n"],
-                group_i: Int[Array, ""],
-                mask_i: Float[Array, "d*g+1"],
-                lower_i: Float[Array, "d*g+1"],
-                upper_i: Float[Array, "d*g+1"],
-            ) -> tuple[Float[Array, "g d"], Float[Array, ""]]:
-                x0 = jnp.concat([rearrange(x_i, "g d -> (d g)"), w_i[None]]) * mask_i
-                loss_args = (
-                    rearrange(target_i, "g d -> (d g)"),
-                    state.rho,
-                    masked_designs[group_i],
-                    y_i,
-                )
-                solution = minimise(
-                    x_update_loss,
-                    x0,
-                    (lower_i, upper_i),
-                    args=(loss_args,),
-                    tol=inner_pgtol,
-                    max_iterations=inner_maxiter,
-                    history_length=history_length,
-                    max_linesearch=inner_max_linesearch,
-                )
-                solution = solution.x * mask_i
-                theta_i = rearrange(solution[:-1], "(d g) -> g d", g=group_size)
-                return theta_i, solution[-1]
+            def solve_single(
+                theta: Float[Array, "d*g"],
+                log_nugget: Float[Array, ""],
+                theta_target: Float[Array, "d*g"],
+                y: Float[Array, "n"],
+            ) -> tuple[Float[Array, "d*g"], Float[Array, ""]]:
+                # augmented Lagrangian objective for the x update step
+                def objective(theta_and_log_nugget: Float[Array, "d*g+1"]):
+                    theta = theta_and_log_nugget[:-1]
+                    nugget = jnp.exp(theta_and_log_nugget[-1])
+                    loss, _ = negative_loglikelihood(theta, nugget, y)
+                    lagrangian = 0.5 * jnp.sum((theta - theta_target) ** 2)
+                    return loss + state.rho * lagrangian
 
-            theta, w = jax.vmap(solve_one, in_axes=(0, 0, 0, 1, 0, 0, 0, 0))(
-                state.x,
-                state.aux,
-                state.z - state.u,
-                y_train,
-                group_of_output,
-                flat_mask,
-                solver_lower,
-                solver_upper,
+                # optimize for a single output with l-bfgs-b
+                res = minimise(
+                    objective,
+                    x0=jnp.concat([theta, log_nugget[None]]),
+                    bounds=(lower, upper),
+                    tol=cosine_schedule(state.iteration / max_iterations),
+                )
+                theta = res.x[:-1]
+                log_nugget = res.x[-1]
+                return theta, log_nugget
+
+            # vectorize over outputs
+            theta = rearrange(state.x, "o d g -> o (d g)")
+            log_nugget = state.aux[0]
+            theta_target = rearrange(state.z - state.u, "o d g -> o (d g)")
+            theta, log_nugget = jax.vmap(solve_single)(
+                theta, log_nugget, theta_target, y_train.T
             )
-            return state._replace(x=jnp.clip(theta, *admm_bounds), aux=w)
+            theta = rearrange(theta, "o (d g) -> o d g", g=g)
+            return state._replace(x=theta, aux=(log_nugget,))
 
-        # run the ADMM solver loop
-        state, converged, iterations = solve(
+        # run the ADMM solver loop from a cold start
+        theta0 = repeat(theta_init, "(d g) -> o d g", o=o, g=g)
+        log_nugget0 = jnp.zeros((o,))
+        state = ADMMState(
+            x=theta0,
+            z=jnp.zeros_like(theta0),
+            u=jnp.zeros_like(theta0),
+            aux=(log_nugget0,),
+        )
+        state = solve(
             x_update,
-            start.x,
-            start.aux,
-            l1_penalty,
-            z0=start.z,
-            u0=start.u,
-            rho0=start.rho,
+            state,
+            l1_penalty=l1_penalty,
             max_iterations=max_iterations,
-            tol=tol,
-            adapt_rho=adapt_rho,
+            **kwargs,
         )
 
-        # build the final model and its optimality certificate
-        theta = rearrange(state.z, "o g d -> o d g")
-        theta = theta if mask is None else theta * mask[..., None]
-        self, llk = cls.unpack_parameters(theta, state.aux, x_train, y_train)
-        certificate = kkt_certificate(
-            self.theta,
-            state.aux,
-            l1_penalty,
-            x_train,
-            y_train,
-            bounds,
-            mask=mask,
-            chunk_size=chunk_size,
+        # build the final model
+        theta = rearrange(state.z, "o d g -> o (d g)")
+        nugget = jnp.exp(state.aux[0])
+        (nll, (b, nu)), grad = jax.vmap(
+            jax.value_and_grad(negative_loglikelihood, has_aux=True)
+        )(theta, nugget, y_train.T)
+
+        # check group lasso stationarity, nugget is unpenalized so plain gradient
+        theta = rearrange(theta, "o (d g) -> o d g", g=g)
+        grad = rearrange(grad, "o (d g) -> o d g", g=g)
+        bounds = (rearrange(v[:-1], "(d g) -> d g", g=g) for v in (lower, upper))
+        certificate = kkt_certificate(theta, grad, l1_penalty, *bounds)
+
+        model = cls(theta, nugget, b, nu, x_train, y_train)
+        return model, nll.sum(), state, certificate
+
+
+class AutoregressiveGaussianProcess(NamedTuple):
+    theta: Float[Array, "do go di gi"]
+    nugget: Float[Array, "do go"]
+    b: Float[Array, "do go"]
+    nu: Float[Array, "do go"]
+
+    x_train: Float[Array, "n d g"]
+
+    @eqx.filter_jit
+    def predict(
+        self, x: Float[Array, "... m d g"]
+    ) -> tuple[Float[Array, "... do go m"], Float[Array, "... do go m m"]]:
+
+        def predict_single(
+            x: Float[Array, "m d g"],
+            theta: Float[Array, "d g"],
+            nugget: Float[Array, ""],
+            b: Float[Array, ""],
+            nu: Float[Array, ""],
+            x_train: Float[Array, "n d g"],
+            y_train: Float[Array, "n"],
+        ) -> tuple[Float[Array, "m"], Float[Array, "m m"]]:
+            # flatten the group dimension for the kernel computations
+            x = rearrange(x, "m d g -> m (d g)")
+            theta = rearrange(theta, "d g -> (d g)")
+            x_train = rearrange(x_train, "n d g -> n (d g)")
+
+            # compute the kernel matrices
+            Kox = nu * kernel(theta, x_train, x)
+            Koo = nu * (kernel(theta, x_train, x_train))
+            Koo = Koo + nugget * jnp.eye(len(y_train))
+            Kxx = nu * kernel(theta, x, x)
+            return gp_posterior(Kxx, Kox, Koo, y_train, b)
+
+        # vectorize over both output axes, scan over batch axes to avoid OOM
+        x, batch = pack([x], "* m d g")
+        axes = (None, 0, 0, 0, 0, None, 1)
+        predict = jax.vmap(jax.vmap(predict_single, in_axes=axes), in_axes=axes)
+        mean, cov = jax.lax.map(lambda x: predict(x, *self, self.x_train), x)
+        [mean] = unpack(mean, batch, "* do go m")
+        [cov] = unpack(cov, batch, "* do go m1 m2")
+        return mean, cov
+
+    @classmethod
+    @eqx.filter_jit
+    def fit(
+        cls,
+        x_train: Float[Array, "n d g"],
+        l1_penalty: Float[Array, ""],
+        *,
+        nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
+        max_iterations: int | Int[Array, ""] = jnp.array(300),
+        **kwargs,
+    ) -> tuple[Self, Float[Array, ""], ADMMState, Float[Array, "g"]]:
+        _, d, g = x_train.shape
+
+        # every lag of every group is its own output, so the targets are the inputs
+        x_train_flat = rearrange(x_train, "n d g -> n (d g)")
+        y_train = rearrange(x_train, "n do go -> do go n")
+
+        # data driven bounds and init for gp mle fit with l-bfsg-b
+        theta_init, lower, upper = hetgpy_auto_bounds(x_train_flat)
+        lower = jnp.zeros_like(lower)  # allow shrink to zero
+        lower = jnp.concat([lower, jnp.log(nugget_range[0:1])])
+        upper = jnp.concat([upper, jnp.log(nugget_range[1:2])])
+
+        # negative loglikelihood for gp mle fit
+        def negative_loglikelihood(
+            theta: Float[Array, "di*gi"],
+            nugget: Float[Array, ""],
+            y: Float[Array, "n"],
+        ):
+            Koo = kernel(theta, x_train_flat, x_train_flat)
+            Koo = Koo + nugget * jnp.eye(len(y))
+            llk, b, nu = gp_loglikelihood(Koo, y)
+            return -llk, (b, nu)
+
+        # x update step, one bound constrained gp mle per output
+        def x_update(state: ADMMState) -> ADMMState:
+            def solve_single(
+                theta: Float[Array, "di*gi"],
+                log_nugget: Float[Array, ""],
+                theta_target: Float[Array, "di*gi"],
+                y: Float[Array, "n"],
+            ) -> tuple[Float[Array, "di*gi"], Float[Array, ""]]:
+                # augmented Lagrangian objective for the x update step
+                def objective(theta_and_log_nugget: Float[Array, "di*gi+1"]):
+                    theta = theta_and_log_nugget[:-1]
+                    nugget = jnp.exp(theta_and_log_nugget[-1])
+                    loss, _ = negative_loglikelihood(theta, nugget, y)
+                    lagrangian = 0.5 * jnp.sum((theta - theta_target) ** 2)
+                    return loss + state.rho * lagrangian
+
+                # optimize for a single output with l-bfgs-b
+                res = minimise(
+                    objective,
+                    x0=jnp.concat([theta, log_nugget[None]]),
+                    bounds=(lower, upper),
+                    tol=cosine_schedule(state.iteration / max_iterations),
+                )
+                theta = res.x[:-1]
+                log_nugget = res.x[-1]
+                return theta, log_nugget
+
+            # vectorize over both output axes
+            theta = rearrange(state.x, "do go di gi -> do go (di gi)")
+            log_nugget = state.aux[0]
+            theta_target = rearrange(state.z - state.u, "do go di gi -> do go (di gi)")
+            theta, log_nugget = jax.vmap(jax.vmap(solve_single))(
+                theta, log_nugget, theta_target, y_train
+            )
+            theta = rearrange(theta, "do go (di gi) -> do go di gi", gi=g)
+            return state._replace(x=theta, aux=(log_nugget,))
+
+        # run the ADMM solver loop from a cold start
+        theta0 = repeat(theta_init, "(di gi) -> do go di gi", do=d, go=g, gi=g)
+        log_nugget0 = jnp.zeros((d, g))
+        state = ADMMState(
+            x=theta0,
+            z=jnp.zeros_like(theta0),
+            u=jnp.zeros_like(theta0),
+            aux=(log_nugget0,),
         )
-        return self, llk, state, converged, iterations, certificate
+        state = solve(
+            x_update,
+            state,
+            l1_penalty=l1_penalty,
+            max_iterations=max_iterations,
+            **kwargs,
+        )
+
+        # build the final model
+        theta = rearrange(state.z, "do go di gi -> do go (di gi)")
+        nugget = jnp.exp(state.aux[0])
+        value_and_grad = jax.value_and_grad(negative_loglikelihood, has_aux=True)
+        (nll, (b, nu)), grad = jax.vmap(jax.vmap(value_and_grad))(
+            theta, nugget, y_train
+        )
+
+        # check group lasso stationarity, nugget is unpenalized so plain gradient
+        theta = rearrange(theta, "do go (di gi) -> do go di gi", gi=g)
+        grad = rearrange(grad, "do go (di gi) -> do go di gi", gi=g)
+        bounds = (rearrange(v[:-1], "(di gi) -> di gi", gi=g) for v in (lower, upper))
+        certificate = kkt_certificate(theta, grad, l1_penalty, *bounds)
+
+        model = cls(theta, nugget, b, nu, x_train)
+        return model, nll.sum(), state, certificate
