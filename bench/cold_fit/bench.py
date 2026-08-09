@@ -22,10 +22,9 @@ FIELDS = [
     "d",
     "g",
     "o",
-    "maxiter",
     "repeat",
     "fit_s",
-    "per_admm_iter_s",
+    "admm_iters",
     "nll",
     "max_kkt",
     "status",
@@ -55,7 +54,6 @@ def parse_args() -> argparse.Namespace:
         "--inclines", type=str, default="inc0", choices=["all", "inc0", "inc5", "inc10"]
     )
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
-    parser.add_argument("--maxiter", type=int, default=10)
     parser.add_argument("--max_repeats", type=int, default=20)
     parser.add_argument("--time_budget_s", type=float, default=0.0)
     return parser.parse_args()
@@ -121,10 +119,10 @@ if __name__ == "__main__":
         model_cls = AutoregressiveGaussianProcess if autoregressive else GaussianProcess
         row = dict(
             chip=chip, dtype=args.dtype, profile=args.profile,
-            n=n, d=d, g=g, o=o, maxiter=args.maxiter,
+            n=n, d=d, g=g, o=o,
         )  # fmt: skip
 
-        # lambda = 0 never trips the dual tolerance, so every fit runs the full budget
+        # full fit at lambda = 0, default iteration cap and tolerance
         def fit():
             return model_cls.fit(
                 x_train,
@@ -132,14 +130,12 @@ if __name__ == "__main__":
                 jnp.zeros((), dtype=args.dtype),
                 profile=args.profile,
                 warmstart=None,
-                max_iterations=args.maxiter,
-                tol=jnp.zeros((), dtype=args.dtype),
             )
 
         # one row per repeat, so a job killed mid-sweep still leaves its measurements
         for repeat in range(args.max_repeats):
             try:
-                seconds, (_, nll, _, certificate) = time_fit(fit)
+                seconds, (_, nll, state, certificate) = time_fit(fit)
             except Exception as error:  # out of memory is the expected wall here
                 print(f"n={n} o={o} FAILED: {type(error).__name__}")
                 print(f"    {str(error).splitlines()[0]}", flush=True)
@@ -149,8 +145,7 @@ if __name__ == "__main__":
             print(
                 f"n={n} d={d} g={g} o={o} {args.profile} repeat={repeat}"
                 f" fit={seconds:.2f}s"
-                f" per_admm_iter={seconds / args.maxiter:.3f}s"
-                f" per_iter_per_output={1e3 * seconds / args.maxiter / o:.2f}ms"
+                f" admm_iters={int(state.iteration)}"
                 f" nll={float(nll):.4f} max_kkt={float(jnp.abs(certificate).max()):.4f}",
                 flush=True,
             )
@@ -159,7 +154,7 @@ if __name__ == "__main__":
                 | dict(
                     repeat=repeat,
                     fit_s=round(seconds, 3),
-                    per_admm_iter_s=round(seconds / args.maxiter, 4),
+                    admm_iters=int(state.iteration),
                     nll=float(nll),
                     max_kkt=float(jnp.abs(certificate).max()),
                     status="ok",

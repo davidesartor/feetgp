@@ -1,4 +1,4 @@
-"""Plot cold-fit ADMM iteration time against training set size, one line per device."""
+"""Plot cold-fit wall time against training set size, one line per device."""
 
 import argparse
 import os
@@ -60,7 +60,7 @@ def chip_color(chip: str) -> str:
 def local_exponent(group: pd.DataFrame) -> float:
     """Cost exponent between the two largest measured sizes."""
     tail = group.iloc[-2:]
-    return float(np.diff(np.log(tail.per_admm_iter_s))[0] / np.diff(np.log(tail.n))[0])
+    return float(np.diff(np.log(tail.fit_s))[0] / np.diff(np.log(tail.n))[0])
 
 
 if __name__ == "__main__":
@@ -69,7 +69,7 @@ if __name__ == "__main__":
 
     # repeat 0 carries the compile, so the fastest observation is the honest one
     ok = results[results.status == "ok"]
-    ok = ok.loc[ok.groupby(["chip", "dtype", "profile", "n"]).per_admm_iter_s.idxmin()]
+    ok = ok.loc[ok.groupby(["chip", "dtype", "profile", "n"]).fit_s.idxmin()]
     oom = results[results.status != "ok"]
 
     figure = go.Figure()
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         figure.add_trace(
             go.Scatter(
                 x=group.n,
-                y=group.per_admm_iter_s,
+                y=group.fit_s,
                 name=label,
                 mode="lines+markers",
                 line=dict(color=color, width=2, dash=DTYPE_DASHES[dtype]),
@@ -91,11 +91,11 @@ if __name__ == "__main__":
                     symbol=PROFILE_SYMBOLS[profile],
                     line=dict(color=SURFACE, width=2),
                 ),
-                customdata=np.stack([group.maxiter, group.fit_s], axis=-1),
+                customdata=np.stack([group.admm_iters], axis=-1),
                 hovertemplate=(
                     f"<b>{label}</b><br>n=%{{x}}<br>"
-                    "%{y:.3f}s per ADMM iteration<br>"
-                    "%{customdata[1]:.1f}s over %{customdata[0]} iterations"
+                    "%{y:.2f}s full fit<br>"
+                    "%{customdata[0]} ADMM iterations"
                     "<extra></extra>"
                 ),
             )
@@ -110,7 +110,7 @@ if __name__ == "__main__":
         figure.add_trace(
             go.Scatter(
                 x=reference_n,
-                y=anchor.per_admm_iter_s * (reference_n / anchor.n) ** 3,
+                y=anchor.fit_s * (reference_n / anchor.n) ** 3,
                 name="n³ reference",
                 mode="lines",
                 line=dict(color=TEXT_MUTED, width=1.5, dash="longdash"),
@@ -134,7 +134,7 @@ if __name__ == "__main__":
 
     figure.update_layout(
         title=dict(
-            text="Cold unregularized GP fit: seconds per ADMM iteration",
+            text="Cold unregularized GP fit: wall time",
             font=dict(color=TEXT_PRIMARY, size=17),
             x=0,
             xref="paper",
@@ -148,7 +148,7 @@ if __name__ == "__main__":
             linecolor=AXIS_LINE,
         ),
         yaxis=dict(
-            title="seconds per ADMM iteration",
+            title="fit seconds",
             type="log",
             dtick=1,
             gridcolor=GRID,
