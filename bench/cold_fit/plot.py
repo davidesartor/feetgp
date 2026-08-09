@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS_PATH = os.path.join(HERE, "results.csv")
+RESULTS_PATH = os.path.join(HERE, "results.jsonl")
 
 SERIES_COLORS = [
     "#3987e5",
@@ -65,7 +65,7 @@ def local_exponent(group: pd.DataFrame) -> float:
 
 if __name__ == "__main__":
     args = parse_args()
-    results = pd.read_csv(args.results)
+    results = pd.read_json(args.results, lines=True)
 
     # repeat 0 carries the compile, so the fastest observation is the honest one
     ok = results[results.status == "ok"]

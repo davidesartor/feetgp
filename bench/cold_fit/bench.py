@@ -1,34 +1,18 @@
 """Wall time of a cold unregularized GP fit as the training set grows."""
 
 import argparse
-import csv
 import fcntl
+import json
 import os
 import platform
 import time
 import jax
 import jax.numpy as jnp
 
-from feetgp.gp import AutoregressiveGaussianProcess, GaussianProcess
+from feetgp.gp import GaussianProcess
 from feetgp.inclinerunning import InclineRunning
 
-RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.csv")
-
-FIELDS = [
-    "chip",
-    "dtype",
-    "profile",
-    "n",
-    "d",
-    "g",
-    "o",
-    "repeat",
-    "fit_s",
-    "admm_iters",
-    "nll",
-    "max_kkt",
-    "status",
-]
+RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.jsonl")
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,13 +61,10 @@ def chip_name(device) -> str:
 
 
 def write_row(row: dict) -> None:
-    """Append under an exclusive lock, so parallel array tasks share one csv."""
-    with open(RESULTS_PATH, "a", newline="") as f:
+    """Append under an exclusive lock, so parallel array tasks share one file."""
+    with open(RESULTS_PATH, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        writer = csv.DictWriter(f, fieldnames=FIELDS)
-        if f.tell() == 0:
-            writer.writeheader()
-        writer.writerow(row)
+        f.write(json.dumps(row) + "\n")
         f.flush()
         fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -95,7 +76,6 @@ if __name__ == "__main__":
     chip = chip_name(jax.devices()[0])
     deadline = time.perf_counter() + args.time_budget_s if args.time_budget_s else 0.0
 
-    autoregressive = args.target == "markers"
     for train_size in args.train_sizes:
         data = InclineRunning(
             path=args.data_dir,
@@ -109,14 +89,9 @@ if __name__ == "__main__":
         x_train = jnp.asarray(data.x_train, dtype=args.dtype)
         n, d, g = x_train.shape
 
-        if autoregressive:
-            targets = ()
-            o = d * g
-        else:
-            targets = (jnp.asarray(data.y_train, dtype=args.dtype),)
-            o = targets[0].shape[1]
+        y_train = jnp.asarray(data.y_train, dtype=args.dtype)
+        o = y_train.shape[1]
 
-        model_cls = AutoregressiveGaussianProcess if autoregressive else GaussianProcess
         row = dict(
             chip=chip, dtype=args.dtype, profile=args.profile,
             n=n, d=d, g=g, o=o,
@@ -124,9 +99,9 @@ if __name__ == "__main__":
 
         # full fit at lambda = 0, default iteration cap and tolerance
         def fit():
-            return model_cls.fit(
+            return GaussianProcess.fit(
                 x_train,
-                *targets,
+                y_train,
                 jnp.zeros((), dtype=args.dtype),
                 profile=args.profile,
                 warmstart=None,
@@ -166,4 +141,4 @@ if __name__ == "__main__":
                 print(f"n={n} budget spent after {repeat + 1} repeats", flush=True)
                 break
 
-        del data, x_train, targets
+        del data, x_train, y_train
