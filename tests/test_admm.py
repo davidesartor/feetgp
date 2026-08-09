@@ -171,6 +171,38 @@ def test_solve_reaches_the_group_lasso_optimum():
             assert np.linalg.norm(grad_group + l1 * theta_group / norm) < 1e-3, group
 
 
+def test_splitting_the_iterate_into_leaves_changes_nothing():
+    rng = np.random.default_rng(6)
+    n, d, g, o, split = 40, 4, 2, 3, 1
+    design = jnp.asarray(rng.normal(size=(n, d * g)))
+    targets = jnp.asarray(rng.normal(size=(n, o)))
+    dense_x_update = least_squares_x_update(design, targets)
+
+    # same update, but the outputs live in two leaves of unequal size
+    def tree_x_update(state: ADMMState) -> ADMMState:
+        merged = state._replace(
+            **{f: jnp.concatenate(getattr(state, f)) for f in ("x", "z", "u")}
+        )
+        x = dense_x_update(merged).x
+        return state._replace(x=(x[:split], x[split:]))
+
+    zeros = jnp.zeros((o, d, g))
+    solve = lambda x_update, x: glasso_admm.solve(
+        x_update,
+        ADMMState(x=x, z=x, u=x),
+        l1_penalty=jnp.array(1.0),
+        max_iterations=3000,
+        tol=jnp.array(1e-6),
+    )
+    dense = solve(dense_x_update, zeros)
+    tree = solve(tree_x_update, (zeros[:split], zeros[split:]))
+
+    assert tree.iteration == dense.iteration
+    assert np.allclose(jnp.concatenate(tree.z), dense.z)
+    assert np.allclose(jnp.concatenate(tree.u), dense.u)
+    assert tree.rho == dense.rho
+
+
 def test_aux_passes_through_untouched():
     x = jnp.ones((2, 2))
     aux = jnp.array([3.0, 4.0])
