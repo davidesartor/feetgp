@@ -23,6 +23,17 @@ class ADMMState(NamedTuple):
         """Both residuals are relative, so one tolerance covers them."""
         return (self.primal_residual <= tol) & (self.dual_residual <= tol)
 
+    def restart(self) -> Self:
+        """Warmstart from the primal iterate alone, dual and rho start over."""
+        return self._replace(
+            z=jnp.zeros_like(self.z),
+            u=jnp.zeros_like(self.u),
+            rho=jnp.array(1.0),
+            iteration=jnp.array(0),
+            primal_residual=jnp.array(jnp.inf),
+            dual_residual=jnp.array(jnp.inf),
+        )
+
 
 UpdateX = Callable[[ADMMState], ADMMState]
 
@@ -32,7 +43,8 @@ def update_z_and_u(state: ADMMState, l1_penalty: Float[Array, ""]) -> ADMMState:
     # compute the group lasso proximal operator
     v = state.x + state.u
     norm = jnp.sqrt(reduce(v**2, "... g -> g", "sum"))
-    z = v * (1 - l1_penalty / state.rho / norm).clip(min=0.0, max=1.0)
+    shrink = jnp.where(norm > 0.0, l1_penalty / state.rho / norm, jnp.inf)
+    z = v * (1 - shrink).clip(min=0.0, max=1.0)
     return state._replace(z=z, u=state.u + state.x - z)
 
 

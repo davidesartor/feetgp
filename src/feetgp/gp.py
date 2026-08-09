@@ -1,4 +1,4 @@
-from typing import NamedTuple, Self
+from typing import Literal, NamedTuple, Self
 from jaxtyping import Array, Int, Float
 
 import jax
@@ -10,20 +10,31 @@ from vlse.optim import minimise
 
 from feetgp.glasso_admm import ADMMState, solve, kkt_certificate
 
-# fp64 is a must otherwise cholesky fails badly
-jax.config.update("jax_enable_x64", True)
+KernelProfile = Literal["rbf", "matern52"]
 
 
 def kernel(
+    profile: KernelProfile,
     theta: Float[Array, "d"],
     x1: Float[Array, "n d"],
     x2: Float[Array, "m d"],
 ) -> Float[Array, "n m"]:
-    # squared exponential ARD kernel, exponent linear in the precisions theta
+    """Stationary ARD kernel, distances scaled by the precisions theta."""
+    # the exponent is linear in theta, so the squared distance expands
     sqn1 = jnp.sum(theta * x1**2, axis=-1)
     sqn2 = jnp.sum(theta * x2**2, axis=-1)
     d2 = sqn1[:, None] + sqn2[None, :] - 2.0 * (theta * x1) @ x2.T
-    return jnp.exp(-0.5 * d2)
+    d2 = jnp.maximum(d2, 0.0)
+
+    if profile == "rbf":
+        return jnp.exp(-0.5 * d2)
+    elif profile == "matern52":
+        # sqrt is not differentiable at zero, so keep the diagonal off it
+        r = jnp.sqrt(5.0 * jnp.where(d2 > 0.0, d2, 1.0))
+        r = jnp.where(d2 > 0.0, r, 0.0)
+        return (1.0 + r + r**2 / 3.0) * jnp.exp(-r)
+    else:
+        raise ValueError(f"unknown kernel profile {profile!r}")
 
 
 def hetgpy_auto_bounds(
@@ -42,7 +53,7 @@ def hetgpy_auto_bounds(
     dists = jnp.maximum(dists, 0.0)
     dists = jnp.where(dists > 0, dists, jnp.nan)
 
-    # lengthscale bounds from target correlations at distance quantiles
+    # lengthscale bounds from target rbf correlations at distance quantiles
     lower = -0.5 * jnp.nanquantile(dists, 0.05) / jnp.log(min_cor) * x_span**2
     upper = -0.5 * jnp.nanquantile(dists, 0.95) / jnp.log(max_cor) * x_span**2
     init = 0.9 * upper + 0.1 * lower
@@ -102,6 +113,8 @@ def gp_loglikelihood(
 
 
 class GaussianProcess(NamedTuple):
+    profile: KernelProfile
+
     theta: Float[Array, "o d g"]
     nugget: Float[Array, "o"]
     b: Float[Array, "o"]
@@ -130,16 +143,19 @@ class GaussianProcess(NamedTuple):
             x_train = rearrange(x_train, "n d g -> n (d g)")
 
             # compute the kernel matrices
-            Kox = nu * kernel(theta, x_train, x)
-            Koo = nu * (kernel(theta, x_train, x_train))
+            Kox = nu * kernel(self.profile, theta, x_train, x)
+            Koo = nu * (kernel(self.profile, theta, x_train, x_train))
             Koo = Koo + nugget * jnp.eye(len(y_train))
-            Kxx = nu * kernel(theta, x, x)
+            Kxx = nu * kernel(self.profile, theta, x, x)
             return gp_posterior(Kxx, Kox, Koo, y_train, b)
 
         # vectorize over outputs, scan over batch axes to avoid OOM
         x, batch = pack([x], "* m d g")
         predict = jax.vmap(predict_single, in_axes=(None, 0, 0, 0, 0, None, 1))
-        mean, cov = jax.lax.map(lambda x: predict(x, *self), x)
+        params = (self.theta, self.nugget, self.b, self.nu)
+        mean, cov = jax.lax.map(
+            lambda x: predict(x, *params, self.x_train, self.y_train), x
+        )
         [mean] = unpack(mean, batch, "* o m")
         [cov] = unpack(cov, batch, "* o m1 m2")
         return mean, cov
@@ -152,6 +168,8 @@ class GaussianProcess(NamedTuple):
         y_train: Float[Array, "n o"],
         l1_penalty: Float[Array, ""],
         *,
+        profile: KernelProfile,
+        warmstart: ADMMState | None = None,
         nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
         max_iterations: int | Int[Array, ""] = jnp.array(300),
         **kwargs,
@@ -172,7 +190,7 @@ class GaussianProcess(NamedTuple):
             nugget: Float[Array, ""],
             y: Float[Array, "n"],
         ):
-            Koo = kernel(theta, x_train_flat, x_train_flat)
+            Koo = kernel(profile, theta, x_train_flat, x_train_flat)
             Koo = Koo + nugget * jnp.eye(len(y))
             llk, b, nu = gp_loglikelihood(Koo, y)
             return -llk, (b, nu)
@@ -214,14 +232,17 @@ class GaussianProcess(NamedTuple):
             theta = rearrange(theta, "o (d g) -> o d g", g=g)
             return state._replace(x=theta, aux=(log_nugget,))
 
-        # run the ADMM solver loop from a cold start
+        # run the ADMM solver loop, cold start unless warmstarted
         theta0 = repeat(theta_init, "(d g) -> o d g", o=o, g=g)
-        log_nugget0 = jnp.zeros((o,))
-        state = ADMMState(
-            x=theta0,
-            z=jnp.zeros_like(theta0),
-            u=jnp.zeros_like(theta0),
-            aux=(log_nugget0,),
+        state = (
+            warmstart.restart()
+            if warmstart is not None
+            else ADMMState(
+                x=theta0,
+                z=jnp.zeros_like(theta0),
+                u=jnp.zeros_like(theta0),
+                aux=(jnp.zeros((o,)),),
+            )
         )
         state = solve(
             x_update,
@@ -244,11 +265,13 @@ class GaussianProcess(NamedTuple):
         bounds = (rearrange(v[:-1], "(d g) -> d g", g=g) for v in (lower, upper))
         certificate = kkt_certificate(theta, grad, l1_penalty, *bounds)
 
-        model = cls(theta, nugget, b, nu, x_train, y_train)
+        model = cls(profile, theta, nugget, b, nu, x_train, y_train)
         return model, nll.sum(), state, certificate
 
 
 class AutoregressiveGaussianProcess(NamedTuple):
+    profile: KernelProfile
+
     theta: Float[Array, "do go di gi"]
     nugget: Float[Array, "do go"]
     b: Float[Array, "do go"]
@@ -276,17 +299,20 @@ class AutoregressiveGaussianProcess(NamedTuple):
             x_train = rearrange(x_train, "n d g -> n (d g)")
 
             # compute the kernel matrices
-            Kox = nu * kernel(theta, x_train, x)
-            Koo = nu * (kernel(theta, x_train, x_train))
+            Kox = nu * kernel(self.profile, theta, x_train, x)
+            Koo = nu * (kernel(self.profile, theta, x_train, x_train))
             Koo = Koo + nugget * jnp.eye(len(y_train))
-            Kxx = nu * kernel(theta, x, x)
+            Kxx = nu * kernel(self.profile, theta, x, x)
             return gp_posterior(Kxx, Kox, Koo, y_train, b)
 
         # vectorize over both output axes, scan over batch axes to avoid OOM
         x, batch = pack([x], "* m d g")
         axes = (None, 0, 0, 0, 0, None, 1)
         predict = jax.vmap(jax.vmap(predict_single, in_axes=axes), in_axes=axes)
-        mean, cov = jax.lax.map(lambda x: predict(x, *self, self.x_train), x)
+        params = (self.theta, self.nugget, self.b, self.nu)
+        mean, cov = jax.lax.map(
+            lambda x: predict(x, *params, self.x_train, self.x_train), x
+        )
         [mean] = unpack(mean, batch, "* do go m")
         [cov] = unpack(cov, batch, "* do go m1 m2")
         return mean, cov
@@ -298,6 +324,8 @@ class AutoregressiveGaussianProcess(NamedTuple):
         x_train: Float[Array, "n d g"],
         l1_penalty: Float[Array, ""],
         *,
+        profile: KernelProfile,
+        warmstart: ADMMState | None = None,
         nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
         max_iterations: int | Int[Array, ""] = jnp.array(300),
         **kwargs,
@@ -320,7 +348,7 @@ class AutoregressiveGaussianProcess(NamedTuple):
             nugget: Float[Array, ""],
             y: Float[Array, "n"],
         ):
-            Koo = kernel(theta, x_train_flat, x_train_flat)
+            Koo = kernel(profile, theta, x_train_flat, x_train_flat)
             Koo = Koo + nugget * jnp.eye(len(y))
             llk, b, nu = gp_loglikelihood(Koo, y)
             return -llk, (b, nu)
@@ -362,14 +390,17 @@ class AutoregressiveGaussianProcess(NamedTuple):
             theta = rearrange(theta, "do go (di gi) -> do go di gi", gi=g)
             return state._replace(x=theta, aux=(log_nugget,))
 
-        # run the ADMM solver loop from a cold start
+        # run the ADMM solver loop, cold start unless warmstarted
         theta0 = repeat(theta_init, "(di gi) -> do go di gi", do=d, go=g, gi=g)
-        log_nugget0 = jnp.zeros((d, g))
-        state = ADMMState(
-            x=theta0,
-            z=jnp.zeros_like(theta0),
-            u=jnp.zeros_like(theta0),
-            aux=(log_nugget0,),
+        state = (
+            warmstart.restart()
+            if warmstart is not None
+            else ADMMState(
+                x=theta0,
+                z=jnp.zeros_like(theta0),
+                u=jnp.zeros_like(theta0),
+                aux=(jnp.zeros((d, g)),),
+            )
         )
         state = solve(
             x_update,
@@ -393,5 +424,5 @@ class AutoregressiveGaussianProcess(NamedTuple):
         bounds = (rearrange(v[:-1], "(di gi) -> di gi", gi=g) for v in (lower, upper))
         certificate = kkt_certificate(theta, grad, l1_penalty, *bounds)
 
-        model = cls(theta, nugget, b, nu, x_train)
+        model = cls(profile, theta, nugget, b, nu, x_train)
         return model, nll.sum(), state, certificate

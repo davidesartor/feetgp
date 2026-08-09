@@ -18,7 +18,7 @@ class Linear(NamedTuple):
 
     @classmethod
     @eqx.filter_jit
-    def glasso_admm_fit(
+    def fit(
         cls,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
@@ -76,7 +76,7 @@ class AutoregressiveLinear(NamedTuple):
 
     @classmethod
     @eqx.filter_jit
-    def glasso_admm_fit(
+    def fit(
         cls,
         x_train: Float[Array, "n d g"],
         l1_penalty: Float[Array, ""],
