@@ -40,7 +40,8 @@ class InclineRunning:
     def __init__(
         self,
         path: str = "data/Incline Running",
-        subsample: int = 1,
+        train_size: int | None = None,
+        seed: int = 0,
         feet: Literal["both", "left_only", "right_only"] = "both",
         target: Literal["markers", "forces"] = "markers",
         inclines: Literal["all", "inc0", "inc5", "inc10"] = "all",
@@ -74,20 +75,24 @@ class InclineRunning:
             self.y_columns = list(self.x_columns)
         print("Loaded target data with shape:", y.shape, y.dtype)
 
-        x, y = x[::subsample], y[::subsample]
         valid = ~np.isnan(x).any(axis=1) & ~np.isnan(y).any(axis=1)
         x, y = x[valid], y[valid]
 
-        self.x_train, self.x_test = x[::2, :], x[1::2, :]
-        self.y_train, self.y_test = y[::2, :], y[1::2, :]
+        # a random draw of train_size frames trains, everything left over tests
+        shuffled = np.random.default_rng(seed).permutation(len(x))
+        n_train = len(x) // 2 if train_size is None else min(train_size, len(x) - 1)
+        train, test = np.sort(shuffled[:n_train]), np.sort(shuffled[n_train:])
+
+        self.x_train, self.x_test = x[train], x[test]
+        self.y_train, self.y_test = y[train], y[test]
         print("train:", self.x_train.shape, self.y_train.shape)
         print("test:", self.x_test.shape, self.y_test.shape)
 
         x_min = np.min(self.x_train, axis=0, keepdims=True)
         x_max = np.max(self.x_train, axis=0, keepdims=True)
         x_range = np.where(x_max == x_min, 1, x_max - x_min)
-        self.x_train = (self.x_train - x_min) / x_range
-        self.x_test = (self.x_test - x_min) / x_range
+        self.x_train = 2 * (self.x_train - x_min) / x_range - 1
+        self.x_test = 2 * (self.x_test - x_min) / x_range - 1
 
         y_mean = np.mean(self.y_train, axis=0, keepdims=True)
         y_std = np.std(self.y_train, axis=0, keepdims=True)
@@ -95,13 +100,26 @@ class InclineRunning:
         self.y_train = (self.y_train - y_mean) / y_std
         self.y_test = (self.y_test - y_mean) / y_std
 
-        # consecutive g columns form one group: same marker across feet and coords
-        self.x_train = rearrange(self.x_train, "n (d g) -> n d g", g=self.group_size)
-        self.x_test = rearrange(self.x_test, "n (d g) -> n d g", g=self.group_size)
+        # consecutive columns form one group: same marker across feet and coords
         self.group_labels = [
             self.group_label(self.x_columns[i : i + self.group_size])
             for i in range(0, len(self.x_columns), self.group_size)
         ]
+
+        # the penalized group axis is the last one, so columns reorder to match
+        order = rearrange(
+            np.arange(len(self.x_columns)), "(g d) -> (d g)", d=self.group_size
+        )
+        self.x_columns = [self.x_columns[i] for i in order]
+        self.x_train, self.x_test = self.x_train[:, order], self.x_test[:, order]
+        if target == "markers":
+            self.y_columns = list(self.x_columns)
+            self.y_train, self.y_test = self.y_train[:, order], self.y_test[:, order]
+
+        self.x_train, self.x_test = (
+            rearrange(x, "n (d g) -> n d g", d=self.group_size)
+            for x in (self.x_train, self.x_test)
+        )
 
     @staticmethod
     def group_label(columns: list[str]) -> str:
