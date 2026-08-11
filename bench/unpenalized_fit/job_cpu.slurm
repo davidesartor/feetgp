@@ -12,7 +12,6 @@
 set -euo pipefail
 mkdir -p bench/unpenalized_fit/logs
 
-DTYPE=${DTYPE:-float64}
 PROFILE=${PROFILE:-rbf}
 TRAIN_SIZES=(16 32 64 128 256 512 1024 2048 4096)
 TRAIN_SIZE=${TRAIN_SIZES[$SLURM_ARRAY_TASK_ID]}
@@ -26,11 +25,11 @@ echo "=========================================="
 echo "Node:  $(hostname)"
 echo "CPU:   $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs) x ${SLURM_CPUS_PER_TASK} cores"
 echo "Date:  $(date)"
-echo "Train: n=${TRAIN_SIZE} dtype=${DTYPE} profile=${PROFILE}"
+echo "Train: n=${TRAIN_SIZE} profile=${PROFILE}"
 echo "=========================================="
 
 # unpenalized lambda=0 fit, cost is maxiter x x_update, so per-iteration time extrapolates
 uv run python -u -m bench.unpenalized_fit.bench \
     --inclines inc0 --target markers --feet both \
-    --train_sizes "${TRAIN_SIZE}" --dtype "${DTYPE}" --profile "${PROFILE}" \
+    --train_sizes "${TRAIN_SIZE}" --profile "${PROFILE}" \
     --max_repeats 12 --time_budget_s 6000

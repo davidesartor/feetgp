@@ -12,6 +12,7 @@ from feetgp.gp import GaussianProcess
 from feetgp.inclinerunning import InclineRunning
 
 RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.jsonl")
+DTYPE = "float32"
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,9 +22,6 @@ def parse_args() -> argparse.Namespace:
         "--train_sizes", type=int, nargs="+", default=[128, 256, 512, 1024]
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--dtype", type=str, default="float32", choices=["float32", "float64"]
-    )
     parser.add_argument(
         "--profile", type=str, default="rbf", choices=["rbf", "matern52"]
     )
@@ -63,7 +61,6 @@ def sanity_checks(
 
 if __name__ == "__main__":
     args = parse_args()
-    jax.config.update("jax_enable_x64", args.dtype == "float64")
     print("JAX devices:", jax.devices(), flush=True)
     chip = chip_name(jax.devices()[0])
     deadline = time.perf_counter() + args.time_budget_s if args.time_budget_s else 0.0
@@ -78,14 +75,14 @@ if __name__ == "__main__":
             inclines=args.inclines,
             ungroup_feet=args.ungroup_feet,
         )
-        x_train = jnp.asarray(data.x_train, dtype=args.dtype)
+        x_train = jnp.asarray(data.x_train, dtype=DTYPE)
         n, d, g = x_train.shape
 
-        y_train = jnp.asarray(data.y_train, dtype=args.dtype)
+        y_train = jnp.asarray(data.y_train, dtype=DTYPE)
         o = y_train.shape[1]
 
         row = dict(
-            chip=chip, dtype=args.dtype, profile=args.profile,
+            chip=chip, dtype=DTYPE, profile=args.profile,
             n=n, d=d, g=g, o=o,
         )  # fmt: skip
 
@@ -94,7 +91,7 @@ if __name__ == "__main__":
             return GaussianProcess.fit(
                 x_train,
                 y_train,
-                jnp.zeros((), dtype=args.dtype),
+                jnp.zeros((), dtype=DTYPE),
                 profile=args.profile,
                 warmstart=None,
                 max_iterations=args.maxiter,

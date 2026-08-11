@@ -30,7 +30,6 @@ def smooth_data():
 
 
 def test_default_precision_is_float32():
-    assert not jax.config.jax_enable_x64
     assert jnp.zeros(1).dtype == jnp.float32
 
 

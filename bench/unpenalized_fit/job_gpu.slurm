@@ -13,7 +13,6 @@
 set -euo pipefail
 mkdir -p bench/unpenalized_fit/logs
 
-DTYPE=${DTYPE:-float64}
 PROFILE=${PROFILE:-rbf}
 ALL_SIZES=(16 32 64 128 256 512 1024 2048 4096)
 # one size per array task, unless the caller asked for a whole sweep in one job
@@ -23,11 +22,11 @@ echo "=========================================="
 echo "Node:  $(hostname)"
 echo "GPUs:  $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sort | uniq -c)"
 echo "Date:  $(date)"
-echo "Train: n=${TRAIN_SIZE} dtype=${DTYPE} profile=${PROFILE}"
+echo "Train: n=${TRAIN_SIZE} profile=${PROFILE}"
 echo "=========================================="
 
 # unpenalized lambda=0 fit, cost is maxiter x x_update, so per-iteration time extrapolates
 uv run python -u -m bench.unpenalized_fit.bench \
     --inclines inc0 --target markers --feet both \
-    --train_sizes ${TRAIN_SIZE} --dtype "${DTYPE}" --profile "${PROFILE}" \
+    --train_sizes ${TRAIN_SIZE} --profile "${PROFILE}" \
     --max_repeats 12 --time_budget_s "${BUDGET:-1200}"

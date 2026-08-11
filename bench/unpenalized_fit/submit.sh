@@ -3,7 +3,6 @@
 set -euo pipefail
 
 GPU=${GPU:-2080ti}
-DTYPE=${DTYPE:-float64}
 PROFILE=${PROFILE:-rbf}
 QOS=${QOS:-}
 SIZES=${SIZES:-}
@@ -16,6 +15,6 @@ else
 fi
 
 sbatch ${QOS:+--qos="$QOS"} --constraint="$GPU" "${ARRAY_AND_TIME[@]}" \
-    --job-name="unpenalized_fit_${GPU}_${DTYPE}_${PROFILE}" \
-    --export=ALL,DTYPE="$DTYPE",PROFILE="$PROFILE",SIZES="$SIZES",BUDGET="${BUDGET:-1200}" \
+    --job-name="unpenalized_fit_${GPU}_${PROFILE}" \
+    --export=ALL,PROFILE="$PROFILE",SIZES="$SIZES",BUDGET="${BUDGET:-1200}" \
     bench/unpenalized_fit/job_gpu.slurm

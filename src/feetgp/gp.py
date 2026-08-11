@@ -8,7 +8,7 @@ import equinox as eqx
 from einops import rearrange, reduce, repeat, pack, unpack
 from vlse.optim import minimise
 
-from feetgp.glasso_admm import ADMMState, solve, kkt_certificate
+from feetgp.glasso_admm import ADMMState, group_norm, solve, kkt_certificate
 
 KernelProfile = Literal["rbf", "matern52"]
 
@@ -45,28 +45,19 @@ def hetgpy_auto_bounds(
     x_span = jnp.where(x_max > x_min, x_max - x_min, 1.0)
     x = (x - x_min) / x_span
 
-    # pairwise squared distances between distinct points
+    # per dimension squared distances between distinct points
     rows, cols = jnp.tril_indices(len(x), k=-1)
-    dists = jnp.sum((x[rows] - x[cols]) ** 2, axis=-1)
-    dists = jnp.maximum(dists, 0.0)
+    dists = jnp.maximum((x[rows] - x[cols]) ** 2, 0.0)
     dists = jnp.where(dists > 0, dists, jnp.nan)
 
     # lengthscale bounds from target rbf correlations at distance quantiles
-    lower = -0.5 * jnp.nanquantile(dists, 0.05) / jnp.log(min_cor) * x_span**2
-    upper = -0.5 * jnp.nanquantile(dists, 0.95) / jnp.log(max_cor) * x_span**2
+    lower = -0.5 * jnp.nanquantile(dists, 0.05, axis=0) / jnp.log(min_cor) * x_span**2
+    upper = -0.5 * jnp.nanquantile(dists, 0.95, axis=0) / jnp.log(max_cor) * x_span**2
     init = 0.9 * upper + 0.1 * lower
 
     # invert into the precision parametrization
     init, lower, upper = 1.0 / init, 1.0 / upper, 1.0 / lower
     return init, lower, upper
-
-
-def cosine_schedule(
-    t: Float[Array, ""], min: float = 1e-4, max: float = 1e-1
-) -> Float[Array, ""]:
-    """Anneal from maximum to minimum over t in [0, 1], flat at both ends."""
-    t = 0.5 * (1.0 + jnp.cos(jnp.pi * t.clip(0.0, 1.0)))
-    return jnp.exp(jnp.log(min) + (jnp.log(max) - jnp.log(min)) * t)
 
 
 def gp_posterior(
@@ -181,12 +172,19 @@ class GaussianProcess(NamedTuple):
         y_train: Float[Array, "n o"],
         *,
         profile: KernelProfile,
+        epsilon: float = 1e-2,
         nugget_range: tuple[float, float] = (0.001, 100),
     ) -> Float[Array, ""]:
-        """Smallest penalty that kills every group, from the gradient at theta = 0."""
+        """Smallest penalty making theta = 0 stationary at its own optimal nugget.
+
+        At theta exactly 0 the constant kernel confounds the trend with the signal
+        and the nugget runs to its bound, so the gradient is evaluated at
+        epsilon * theta_init with the nugget optimized there per output.
+        """
         _, d, g = x_train.shape
         x_train_flat = rearrange(x_train, "n d g -> n (d g)")
-        theta_zero = jnp.zeros((d, g), dtype=x_train.dtype)
+        theta_init, _, _ = hetgpy_auto_bounds(x_train_flat)
+        theta_eps = epsilon * rearrange(theta_init, "(d g) -> d g", g=g)
         log_nugget_range = jnp.log(jnp.asarray(nugget_range, dtype=x_train.dtype))
 
         def loss(
@@ -199,18 +197,19 @@ class GaussianProcess(NamedTuple):
             )
             return nll
 
-        def gradient_at_zero(y: Float[Array, "n"]) -> Float[Array, "d g"]:
-            # the nugget is the only free parameter left when every group is dead
+        def squared_gradient(y: Float[Array, "n"]) -> Float[Array, "g"]:
+            # the self-consistent nugget of the near-dead model, per output
             log_nugget = minimise(
-                lambda log_nugget: loss(theta_zero, log_nugget, y),
+                lambda ln: loss(theta_eps, ln, y),
                 x0=jnp.mean(log_nugget_range),
-                bounds=(log_nugget_range[0], log_nugget_range[1]),
+                bounds=tuple(log_nugget_range),
             ).x
-            return jax.grad(loss)(theta_zero, log_nugget, y)
+            # theta sits near its lower bound, only inward components revive a group
+            grad = jax.grad(loss)(theta_eps, log_nugget, y)
+            return reduce(jnp.minimum(grad, 0.0) ** 2, "d g -> g", "sum")
 
-        # theta sits on its lower bound, so only inward components can revive a group
-        grad = jnp.minimum(jax.vmap(gradient_at_zero)(y_train.T), 0.0)
-        return jnp.max(jnp.sqrt(reduce(grad**2, "o d g -> g", "sum")))
+        pooled = reduce(jax.vmap(squared_gradient)(y_train.T), "o g -> g", "sum")
+        return jnp.max(jnp.sqrt(pooled))
 
     @staticmethod
     @eqx.filter_jit
@@ -221,6 +220,7 @@ class GaussianProcess(NamedTuple):
         *,
         profile: KernelProfile,
         warmstart: ADMMState | None = None,
+        restart: bool = True,
         nugget_range: tuple[float, float] = (0.001, 100),
         max_iterations: int | Int[Array, ""] = jnp.array(300),
         **kwargs,
@@ -246,6 +246,8 @@ class GaussianProcess(NamedTuple):
 
         # x update step, one bound constrained gp mle per output
         def x_update(state: ADMMState) -> ADMMState:
+            inner_tol = 1e-4
+
             def solve_single(
                 theta: Float[Array, "d g"],
                 log_nugget: Float[Array, ""],
@@ -266,7 +268,7 @@ class GaussianProcess(NamedTuple):
                     objective,
                     x0=(theta, log_nugget),
                     bounds=(lower, upper),
-                    tol=cosine_schedule(state.iteration / max_iterations),
+                    tol=inner_tol,
                 )
                 return res.x
 
@@ -280,11 +282,40 @@ class GaussianProcess(NamedTuple):
         # run the ADMM solver loop, cold start unless warmstarted
         theta0 = repeat(theta_init, "d g -> o d g", o=o)
         zeros = jnp.zeros_like(theta0)
-        state = (
-            warmstart.restart()
-            if warmstart is not None
-            else ADMMState(x=theta0, z=zeros, u=zeros, aux=(jnp.zeros((o,)),))
+
+        # rho=0 makes the x update a plain mle, whose scale sets the prox threshold
+        mle = x_update(
+            ADMMState(
+                x=theta0,
+                z=theta0,
+                u=zeros,
+                rho=jnp.zeros((), theta0.dtype),
+                aux=(jnp.zeros((o,)),),
+            )
         )
+        # largest rho whose prox threshold still reaches every group at the mle
+        rho0 = l1_penalty / jnp.max(group_norm(mle.x))
+
+        # every solve starts from the boundary rho, never the previous solve's rho
+        state = (
+            (
+                warmstart.restart(rho0)
+                if restart
+                else warmstart._replace(rho=rho0).resume()
+            )
+            if warmstart is not None
+            # cold start feasible at theta_init, so the first x update anchors there
+            else ADMMState(
+                x=theta0, z=theta0, u=zeros, rho=rho0, aux=(jnp.zeros((o,)),)
+            )
+        )
+        # solve casts scalars to x's dtype, match it upfront so the carry is stable
+        state = state._replace(
+            rho=jnp.asarray(state.rho, theta0.dtype),
+            primal_residual=jnp.asarray(state.primal_residual, theta0.dtype),
+            dual_residual=jnp.asarray(state.dual_residual, theta0.dtype),
+        )
+
         state = solve(
             x_update,
             state,

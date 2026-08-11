@@ -18,15 +18,15 @@ def scipy_reference(fun, x0, lower, upper, tol=TOL, history_length=10):
 
     def numpy_value_and_grad(x):
         f, grad = value_and_grad(jnp.asarray(x, dtype=jnp.float32))
-        return float(f), np.asarray(grad, dtype=np.float64)
+        return float(f), np.asarray(grad, dtype=np.double)
 
     result = scipy_minimize(
         numpy_value_and_grad,
-        np.asarray(x0, dtype=np.float64),
+        np.asarray(x0, dtype=np.double),
         jac=True,
         method="L-BFGS-B",
         bounds=Bounds(
-            np.asarray(lower, dtype=np.float64), np.asarray(upper, dtype=np.float64)
+            np.asarray(lower, dtype=np.double), np.asarray(upper, dtype=np.double)
         ),
         options=dict(maxiter=1000, maxcor=history_length, ftol=0.0, gtol=tol),
     )

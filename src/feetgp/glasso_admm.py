@@ -6,8 +6,6 @@ import jax.numpy as jnp
 import equinox as eqx
 from einops import reduce
 
-RHO_MIN, RHO_MAX = 1e-4, 1e4
-
 # every leaf carries the group axis last, the penalty pools across all of them
 Blocks = PyTree[Float[Array, "... g"]]
 
@@ -32,17 +30,30 @@ class ADMMState(NamedTuple):
 
     def converged(self, tol: Float[Array, ""]) -> Bool[Array, ""]:
         """Both residuals are relative, so one tolerance covers them."""
-        return (self.primal_residual <= tol) & (self.dual_residual <= tol)
+        # a few iterations minimum, z=0 u=0 starts pass both residuals trivially
+        return (
+            (self.iteration >= 5)
+            & (self.primal_residual <= tol)
+            & (self.dual_residual <= tol)
+        )
 
-    def restart(self) -> Self:
+    def restart(self, rho: Float[Array, ""] = jnp.array(1.0)) -> Self:
         """Warmstart from the primal iterate alone, dual and rho start over."""
         return self._replace(
             z=jax.tree.map(jnp.zeros_like, self.z),
             u=jax.tree.map(jnp.zeros_like, self.u),
-            rho=jnp.array(1.0),
-            iteration=jnp.array(0),
-            primal_residual=jnp.array(jnp.inf),
-            dual_residual=jnp.array(jnp.inf),
+            rho=jnp.asarray(rho, self.rho.dtype),
+            iteration=jnp.zeros_like(self.iteration),
+            primal_residual=jnp.full_like(self.primal_residual, jnp.inf),
+            dual_residual=jnp.full_like(self.dual_residual, jnp.inf),
+        )
+
+    def resume(self) -> Self:
+        """Warmstart keeping primal, dual and rho, only the counters start over."""
+        return self._replace(
+            iteration=jnp.zeros_like(self.iteration),
+            primal_residual=jnp.full_like(self.primal_residual, jnp.inf),
+            dual_residual=jnp.full_like(self.dual_residual, jnp.inf),
         )
 
 
@@ -73,11 +84,11 @@ def update_residuals(state: ADMMState, prev: ADMMState) -> ADMMState:
     dual = state.rho * norm(jax.tree.map(jnp.subtract, state.z, prev.z))
     dual_target = state.rho * norm(state.u)
 
-    # a zero target leaves the ratio at inf, or at zero when the residual vanishes
+    # floor the targets at one, so a vanishing target cannot certify a moving iterate
     return state._replace(
         iteration=state.iteration + 1,
-        primal_residual=jnp.nan_to_num(primal / primal_target),
-        dual_residual=jnp.nan_to_num(dual / dual_target),
+        primal_residual=primal / jnp.maximum(primal_target, 1.0),
+        dual_residual=dual / jnp.maximum(dual_target, 1.0),
     )
 
 
@@ -87,7 +98,7 @@ def update_rho(state: ADMMState, adapt: Bool[Array, ""]) -> ADMMState:
     increase = (state.primal_residual > 10 * state.dual_residual) & adapt
     decrease = (state.dual_residual > 10 * state.primal_residual) & adapt
     scale = jnp.select([increase, decrease], [2.0, 0.5], default=1.0)
-    new_rho = jnp.clip(state.rho * scale, RHO_MIN, RHO_MAX)
+    new_rho = state.rho * scale
     u = jax.tree.map(lambda leaf: leaf * (state.rho / new_rho), state.u)
     return state._replace(rho=new_rho, u=u)
 
@@ -112,7 +123,7 @@ def solve(
 
     # default tol depends on the machine precision
     eps = jnp.finfo(dtype).eps
-    tol = jnp.asarray(100 * eps, dtype) if tol is None else jnp.asarray(tol, dtype)
+    tol = jnp.asarray(10 * eps, dtype) if tol is None else jnp.asarray(tol, dtype)
 
     # define admm loop condition and body
     def while_condition(state: ADMMState) -> Bool[Array, ""]:
