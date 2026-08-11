@@ -1,4 +1,4 @@
-"""Plot cold-fit wall time against training set size, one line per device."""
+"""Plot unpenalized-fit wall time against training set size, one line per device."""
 
 import argparse
 import os
@@ -134,7 +134,7 @@ if __name__ == "__main__":
 
     figure.update_layout(
         title=dict(
-            text="Cold unregularized GP fit: wall time",
+            text="Unpenalized GP fit: wall time",
             font=dict(color=TEXT_PRIMARY, size=17),
             x=0,
             xref="paper",

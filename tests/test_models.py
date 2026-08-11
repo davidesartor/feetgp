@@ -5,16 +5,51 @@ import pytest
 from einops import rearrange
 from vlse.optim import minimise
 
-from feetgp.gp import GaussianProcess, gp_posterior, hetgpy_auto_bounds, kernel
+from feetgp.gp import (
+    GaussianProcess,
+    gp_posterior,
+    hetgpy_auto_bounds,
+    kernel,
+)
 from feetgp.linear import Linear
 
 from conftest import flat_design, group_norms, x_update_objective
 
 
+def gp_fit(x_train, y_train, profile, **kwargs):
+    return GaussianProcess(profile=profile).fit(x_train, y_train, **kwargs)
+
+
+def test_linear_loss_grad_matches_closed_form(toy_data):
+    x_train, y_train = toy_data
+    rng = np.random.default_rng(0)
+    theta = jnp.asarray(rng.normal(size=(y_train.shape[1], *x_train.shape[1:])))
+
+    x = x_train - x_train.mean(axis=0)
+    y = y_train - y_train.mean(axis=0)
+    grad = jax.grad(Linear.loss)(theta, x, y)
+
+    design = flat_design(x)
+    closed_form = design.T @ (design @ rearrange(theta, "o d g -> (d g) o") - y)
+    closed_form = rearrange(closed_form, "(d g) o -> o d g", g=x_train.shape[2])
+    assert np.allclose(grad, closed_form, rtol=1e-4, atol=1e-4)
+
+
+def test_linear_lambda_max_matches_closed_form(toy_data):
+    x_train, y_train = toy_data
+
+    x = x_train - x_train.mean(axis=0)
+    y = y_train - y_train.mean(axis=0)
+    grad = rearrange(flat_design(x).T @ y, "(d g) o -> o d g", g=x_train.shape[2])
+    expected = group_norms(grad).max()
+
+    assert np.allclose(Linear().lambda_max(x_train, y_train), expected, rtol=1e-4)
+
+
 def test_linear_fit_satisfies_group_lasso_kkt(toy_data):
     x_train, y_train = toy_data
     l1 = 0.5
-    model, _, _, _ = Linear.fit(
+    model, _, _, _ = Linear().fit(
         x_train,
         y_train,
         l1_penalty=jnp.array(l1),
@@ -98,16 +133,14 @@ def test_gp_predict_matches_per_output_posterior(profile, toy_data):
     _, d, g = x_train.shape
     xs = jnp.asarray(rng.uniform(size=(5, d, g)))
     model = GaussianProcess(
+        profile=profile,
         theta=jnp.asarray(rng.uniform(0.5, 2.0, size=(o, d, g))),
         nugget=jnp.full((o,), 0.1),
         b=jnp.asarray(rng.normal(size=(o,))),
         nu=jnp.full((o,), 1.3),
-        x_train=x_train,
-        y_train=y_train,
-        profile=profile,
     )
 
-    mean, cov = model.predict(xs)
+    mean, cov = model.predict(xs, x_train, y_train)
     assert mean.shape == (o, len(xs))
     assert cov.shape == (o, len(xs), len(xs))
 
@@ -119,12 +152,14 @@ def test_gp_predict_matches_per_output_posterior(profile, toy_data):
         Koo = Koo + nugget * jnp.eye(len(x_train))
         Kox = nu * kernel(profile, theta_flat, design, xs_flat)
         Kxx = nu * kernel(profile, theta_flat, xs_flat, xs_flat)
-        expected, expected_cov = gp_posterior(Kxx, Kox, Koo, y_train[:, i], model.b[i])
+        expected, expected_cov = gp_posterior(
+            Kxx, Kox, Koo, y_train[:, i], model.b[i]
+        )
         assert np.allclose(mean[i], expected, rtol=1e-4, atol=1e-5)
         assert np.allclose(cov[i], expected_cov, rtol=1e-4, atol=1e-5)
 
     # a mock query axis vectorizes to per-point 1x1 covariances
-    batched_mean, batched_cov = model.predict(xs[:, None])
+    batched_mean, batched_cov = model.predict(xs[:, None], x_train, y_train)
     assert batched_cov.shape == (len(xs), o, 1, 1)
     assert np.allclose(
         rearrange(batched_mean, "m o 1 -> o m"), mean, rtol=1e-4, atol=1e-5
@@ -193,13 +228,8 @@ def test_inner_solver_stops_before_its_cap(toy_data):
 def test_fit_converges_within_its_iteration_budget(toy_data):
     x_train, y_train = toy_data
     tol = jnp.array(1e-3)
-    _, _, state, _ = GaussianProcess.fit(
-        x_train,
-        y_train,
-        l1_penalty=jnp.array(0.5),
-        max_iterations=300,
-        tol=tol,
-        profile="rbf",
+    _, _, state, _ = gp_fit(
+        x_train, y_train, "rbf", l1_penalty=jnp.array(0.5), max_iterations=300, tol=tol
     )
     assert state.converged(tol), (state.primal_residual, state.dual_residual)
 
@@ -208,47 +238,49 @@ def test_fit_respects_the_auto_bounds(toy_data):
     x_train, y_train = toy_data
     nugget_range = jnp.array([0.001, 100.0])
     _, _, upper = hetgpy_auto_bounds(flat_design(x_train))
-    model, _, state, _ = GaussianProcess.fit(
+    model, _, state, _ = gp_fit(
         x_train,
         y_train,
+        "rbf",
         l1_penalty=jnp.array(0.1),
         max_iterations=20,
         nugget_range=nugget_range,
-        profile="rbf",
     )
 
     # l-bfgs-b keeps the primal iterate in the box, the prox output only follows it
     upper = rearrange(upper, "(d g) -> d g", g=x_train.shape[2])
     assert (state.x >= 0.0).all()
     assert (state.x <= upper + 1e-5).all()
-    assert np.allclose(model.nugget.clip(*nugget_range), model.nugget, rtol=1e-6)
-
-
-def test_fit_carries_its_profile_into_the_model(profile, toy_data):
-    x_train, y_train = toy_data
-    model, nll, _, _ = GaussianProcess.fit(
-        x_train, y_train, l1_penalty=jnp.array(0.1), max_iterations=5, profile=profile
+    assert np.allclose(
+        model.nugget.clip(*nugget_range), model.nugget, rtol=1e-6
     )
-    assert model.profile == profile
+
+
+def test_fit_is_usable_under_every_profile(profile, toy_data):
+    x_train, y_train = toy_data
+    model, nll, _, _ = gp_fit(
+        x_train, y_train, profile, l1_penalty=jnp.array(0.1), max_iterations=5
+    )
     assert np.isfinite(nll)
-    assert np.isfinite(model.predict(x_train[:3])[0]).all()
+    mean, _ = model.predict(x_train[:3], x_train, y_train)
+    assert np.isfinite(mean).all()
 
 
 def test_warmstart_keeps_the_primal_iterate_and_restarts_the_dual(toy_data):
     x_train, y_train = toy_data
-    _, _, state, _ = GaussianProcess.fit(
-        x_train, y_train, l1_penalty=jnp.array(0.1), max_iterations=4, profile="rbf"
+    _, _, state, _ = gp_fit(
+        x_train, y_train, "rbf", l1_penalty=jnp.array(0.1), max_iterations=4
     )
     assert not np.allclose(state.u, 0.0)
 
     def one_iteration(warmstart):
-        _, _, next_state, _ = GaussianProcess.fit(
+        _, _, next_state, _ = gp_fit(
             x_train,
             y_train,
+            "rbf",
             l1_penalty=jnp.array(0.2),
             max_iterations=1,
             warmstart=warmstart,
-            profile="rbf",
         )
         return next_state
 

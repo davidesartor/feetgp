@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=feetgp_cold_fit_cpu
-#SBATCH --output=bench/cold_fit/logs/cold_fit_cpu_%A_%a.out
-#SBATCH --error=bench/cold_fit/logs/cold_fit_cpu_%A_%a.err
+#SBATCH --job-name=feetgp_unpenalized_fit_cpu
+#SBATCH --output=bench/unpenalized_fit/logs/unpenalized_fit_cpu_%A_%a.out
+#SBATCH --error=bench/unpenalized_fit/logs/unpenalized_fit_cpu_%A_%a.err
 #SBATCH --time=02:00:00
 #SBATCH --partition=cpu,cpu-preempt
 #SBATCH --nodes=1
@@ -10,7 +10,7 @@
 #SBATCH --array=0-8
 
 set -euo pipefail
-mkdir -p bench/cold_fit/logs
+mkdir -p bench/unpenalized_fit/logs
 
 DTYPE=${DTYPE:-float64}
 PROFILE=${PROFILE:-rbf}
@@ -29,8 +29,8 @@ echo "Date:  $(date)"
 echo "Train: n=${TRAIN_SIZE} dtype=${DTYPE} profile=${PROFILE}"
 echo "=========================================="
 
-# cold lambda=0 fit, cost is maxiter x x_update, so per-iteration time extrapolates
-uv run python -u -m bench.cold_fit.bench \
+# unpenalized lambda=0 fit, cost is maxiter x x_update, so per-iteration time extrapolates
+uv run python -u -m bench.unpenalized_fit.bench \
     --inclines inc0 --target markers --feet both \
     --train_sizes "${TRAIN_SIZE}" --dtype "${DTYPE}" --profile "${PROFILE}" \
     --max_repeats 12 --time_budget_s 6000

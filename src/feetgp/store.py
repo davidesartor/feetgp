@@ -42,7 +42,7 @@ def model_to_arrays(model: NamedTuple) -> dict[str, np.ndarray]:
     return {
         f"model.{field}": np.asarray(value)
         for field, value in zip(model._fields, model)
-        if hasattr(value, "shape") and field not in ("x_train", "y_train")
+        if hasattr(value, "shape")
     }
 
 

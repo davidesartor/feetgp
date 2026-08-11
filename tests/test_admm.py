@@ -203,21 +203,23 @@ def test_splitting_the_iterate_into_leaves_changes_nothing():
     assert tree.rho == dense.rho
 
 
-def test_aux_passes_through_untouched():
+def test_aux_rides_along_untouched():
     x = jnp.ones((2, 2))
-    aux = jnp.array([3.0, 4.0])
+    side = jnp.array([3.0, 4.0])
 
     def x_update(state: ADMMState) -> ADMMState:
         return state._replace(aux=(state.aux[0] + 1.0,))
 
     state = glasso_admm.solve(
         x_update,
-        ADMMState(x=x, z=jnp.zeros_like(x), u=jnp.zeros_like(x), aux=(aux,)),
+        ADMMState(x=x, z=jnp.zeros_like(x), u=jnp.zeros_like(x), aux=(side,)),
         l1_penalty=jnp.array(0.5),
         max_iterations=3,
         tol=jnp.array(0.0),
     )
-    assert np.allclose(state.aux[0], aux + state.iteration)
+
+    # only the x update writes aux, the prox and the residuals never see it
+    assert np.allclose(state.aux[0], side + state.iteration)
 
 
 def test_restart_keeps_the_primal_iterate_and_drops_the_rest():

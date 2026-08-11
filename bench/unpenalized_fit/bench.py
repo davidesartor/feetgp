@@ -1,14 +1,13 @@
-"""Wall time of a cold unregularized GP fit as the training set grows."""
+"""Wall time of an unpenalized GP fit as the training set grows."""
 
 import argparse
-import fcntl
-import json
 import os
-import platform
 import time
 import jax
 import jax.numpy as jnp
+from einops import reduce
 
+from bench.common import chip_name, eps_multiple, time_call, write_row
 from feetgp.gp import GaussianProcess
 from feetgp.inclinerunning import InclineRunning
 
@@ -38,35 +37,26 @@ def parse_args() -> argparse.Namespace:
         "--inclines", type=str, default="inc0", choices=["all", "inc0", "inc5", "inc10"]
     )
     parser.add_argument("--ungroup_feet", action="store_true", default=False)
+    parser.add_argument("--maxiter", type=int, default=300)
     parser.add_argument("--max_repeats", type=int, default=20)
     parser.add_argument("--time_budget_s", type=float, default=0.0)
     return parser.parse_args()
 
 
-def time_fit(fit) -> tuple[float, tuple]:
-    """Wall time of one blocking fit, repeat 0 also carrying the compile."""
-    start = time.perf_counter()
-    result = jax.block_until_ready(fit())
-    return time.perf_counter() - start, result
-
-
-def chip_name(device) -> str:
-    """Device kind, except on cpu where every host reports the useless "cpu"."""
-    if device.platform != "cpu":
-        return device.device_kind
-    for line in open("/proc/cpuinfo"):
-        if line.startswith("model name"):
-            return line.split(":", 1)[1].strip()
-    return platform.processor() or "cpu"
-
-
-def write_row(row: dict) -> None:
-    """Append under an exclusive lock, so parallel array tasks share one file."""
-    with open(RESULTS_PATH, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(json.dumps(row) + "\n")
-        f.flush()
-        fcntl.flock(f, fcntl.LOCK_UN)
+def sanity_checks(model, state, certificate, n_groups: int, max_iterations: int) -> dict:
+    """At lambda = 0 nothing may be shrunk away and the fit must be stationary."""
+    group_norms = jnp.sqrt(reduce(model.theta**2, "o d g -> g", "sum"))
+    n_active = int(jnp.sum(group_norms > 1e-8))
+    dtype = model.theta.dtype
+    return dict(
+        n_active=n_active,
+        max_kkt=float(jnp.abs(certificate).max()),
+        all_groups_alive=n_active == n_groups,
+        finite=bool(jnp.isfinite(model.theta).all() & jnp.isfinite(model.nu).all()),
+        converged=int(state.iteration) < max_iterations,
+        primal_residual_eps=eps_multiple(state.primal_residual, dtype),
+        dual_residual_eps=eps_multiple(state.dual_residual, dtype),
+    )
 
 
 if __name__ == "__main__":
@@ -99,41 +89,48 @@ if __name__ == "__main__":
 
         # full fit at lambda = 0, default iteration cap and tolerance
         def fit():
-            return GaussianProcess.fit(
+            return GaussianProcess(args.profile).fit(
                 x_train,
                 y_train,
                 jnp.zeros((), dtype=args.dtype),
-                profile=args.profile,
                 warmstart=None,
+                max_iterations=args.maxiter,
             )
 
         # one row per repeat, so a job killed mid-sweep still leaves its measurements
         for repeat in range(args.max_repeats):
             try:
-                seconds, (_, nll, state, certificate) = time_fit(fit)
+                seconds, (model, nll, state, certificate) = time_call(fit)
             except Exception as error:  # out of memory is the expected wall here
                 print(f"n={n} o={o} FAILED: {type(error).__name__}")
                 print(f"    {str(error).splitlines()[0]}", flush=True)
-                write_row(row | dict(repeat=repeat, status=type(error).__name__))
+                write_row(
+                    RESULTS_PATH, row | dict(repeat=repeat, status=type(error).__name__)
+                )
                 break
 
+            checks = sanity_checks(model, state, certificate, g, args.maxiter)
             print(
                 f"n={n} d={d} g={g} o={o} {args.profile} repeat={repeat}"
                 f" fit={seconds:.2f}s"
                 f" admm_iters={int(state.iteration)}"
-                f" nll={float(nll):.4f} max_kkt={float(jnp.abs(certificate).max()):.4f}",
+                f" nll={float(nll):.4f} max_kkt={checks['max_kkt']:.4f}"
+                f" active={checks['n_active']}/{g}"
+                f" residuals={checks['primal_residual_eps']:.3g}"
+                f"/{checks['dual_residual_eps']:.3g} eps",
                 flush=True,
             )
             write_row(
+                RESULTS_PATH,
                 row
                 | dict(
                     repeat=repeat,
                     fit_s=round(seconds, 3),
                     admm_iters=int(state.iteration),
                     nll=float(nll),
-                    max_kkt=float(jnp.abs(certificate).max()),
                     status="ok",
                 )
+                | checks,
             )
 
             # stop once another fit of the same cost would run past the walltime cap

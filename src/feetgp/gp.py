@@ -1,4 +1,4 @@
-from typing import Literal, NamedTuple, Self
+from typing import Literal, NamedTuple, Optional
 from jaxtyping import Array, Int, Float
 
 import jax
@@ -20,7 +20,6 @@ def kernel(
     x2: Float[Array, "m d"],
 ) -> Float[Array, "n m"]:
     """Stationary ARD kernel, distances scaled by the precisions theta."""
-    # the exponent is linear in theta, so the squared distance expands
     sqn1 = jnp.sum(theta * x1**2, axis=-1)
     sqn2 = jnp.sum(theta * x2**2, axis=-1)
     d2 = sqn1[:, None] + sqn2[None, :] - 2.0 * (theta * x1) @ x2.T
@@ -29,10 +28,9 @@ def kernel(
     if profile == "rbf":
         return jnp.exp(-0.5 * d2)
     elif profile == "matern52":
-        # sqrt is not differentiable at zero, so keep the diagonal off it
         r = jnp.sqrt(5.0 * jnp.where(d2 > 0.0, d2, 1.0))
-        r = jnp.where(d2 > 0.0, r, 0.0)
-        return (1.0 + r + r**2 / 3.0) * jnp.exp(-r)
+        matern = (1.0 + r + r**2 / 3.0) * jnp.exp(-r)
+        return jnp.where(d2 > 0.0, matern, 1.0 - 5.0 / 6.0 * d2)
     else:
         raise ValueError(f"unknown kernel profile {profile!r}")
 
@@ -114,19 +112,21 @@ def gp_loglikelihood(
 
 class GaussianProcess(NamedTuple):
     profile: KernelProfile
+    theta: Optional[Float[Array, "o d g"]] = None
+    nugget: Optional[Float[Array, "o"]] = None
 
-    theta: Float[Array, "o d g"]
-    nugget: Float[Array, "o"]
-    b: Float[Array, "o"]
-    nu: Float[Array, "o"]
-
-    x_train: Float[Array, "n d g"]
-    y_train: Float[Array, "n o"]
+    # profiled out of the likelihood, so the solver never sees these two
+    b: Optional[Float[Array, "o"]] = None
+    nu: Optional[Float[Array, "o"]] = None
 
     @eqx.filter_jit
     def predict(
-        self, x: Float[Array, "... m d g"]
+        self,
+        x: Float[Array, "... m d g"],
+        x_train: Float[Array, "n d g"],
+        y_train: Float[Array, "n o"],
     ) -> tuple[Float[Array, "... o m"], Float[Array, "... o m m"]]:
+        profile = self.profile
 
         def predict_single(
             x: Float[Array, "m d g"],
@@ -143,71 +143,88 @@ class GaussianProcess(NamedTuple):
             x_train = rearrange(x_train, "n d g -> n (d g)")
 
             # compute the kernel matrices
-            Kox = nu * kernel(self.profile, theta, x_train, x)
-            Koo = nu * (kernel(self.profile, theta, x_train, x_train))
+            Kox = nu * kernel(profile, theta, x_train, x)
+            Koo = nu * (kernel(profile, theta, x_train, x_train))
             Koo = Koo + nugget * jnp.eye(len(y_train))
-            Kxx = nu * kernel(self.profile, theta, x, x)
+            Kxx = nu * kernel(profile, theta, x, x)
             return gp_posterior(Kxx, Kox, Koo, y_train, b)
 
         # vectorize over outputs, scan over batch axes to avoid OOM
         x, batch = pack([x], "* m d g")
         predict = jax.vmap(predict_single, in_axes=(None, 0, 0, 0, 0, None, 1))
         params = (self.theta, self.nugget, self.b, self.nu)
-        mean, cov = jax.lax.map(
-            lambda x: predict(x, *params, self.x_train, self.y_train), x
-        )
+        mean, cov = jax.lax.map(lambda x: predict(x, *params, x_train, y_train), x)
         [mean] = unpack(mean, batch, "* o m")
         [cov] = unpack(cov, batch, "* o m1 m2")
         return mean, cov
 
-    @classmethod
+    @staticmethod
+    def loss(
+        theta: Float[Array, "d g"],
+        nugget: Float[Array, ""],
+        x_train_flat: Float[Array, "n dg"],
+        y: Float[Array, "n"],
+        *,
+        profile: KernelProfile,
+    ) -> tuple[Float[Array, ""], tuple[Float[Array, ""], Float[Array, ""]]]:
+        """Profiled gp mle objective, with the closed-form trend and variance."""
+        theta = rearrange(theta, "d g -> (d g)")
+        Koo = kernel(profile, theta, x_train_flat, x_train_flat)
+        Koo = Koo + nugget * jnp.eye(len(y))
+        llk, b, nu = gp_loglikelihood(Koo, y)
+        return -llk, (b, nu)
+
     @eqx.filter_jit
     def lambda_max(
-        cls,
+        self,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
         *,
-        profile: KernelProfile,
-        nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
+        nugget_range: tuple[float, float] = (0.001, 100),
     ) -> Float[Array, ""]:
         """Smallest penalty that kills every group, from the gradient at theta = 0."""
+        profile = self.profile
         _, d, g = x_train.shape
         x_train_flat = rearrange(x_train, "n d g -> n (d g)")
-        theta_zero = jnp.zeros((d, g))
+        theta_zero = jnp.zeros((d, g), dtype=x_train.dtype)
+        log_nugget_range = jnp.log(jnp.asarray(nugget_range, dtype=x_train.dtype))
 
-        def negative_loglikelihood(theta, log_nugget, y):
-            theta = rearrange(theta, "d g -> (d g)")
-            Koo = kernel(profile, theta, x_train_flat, x_train_flat)
-            Koo = Koo + jnp.exp(log_nugget) * jnp.eye(len(y))
-            return -gp_loglikelihood(Koo, y)[0]
+        def loss(
+            theta: Float[Array, "d g"],
+            log_nugget: Float[Array, ""],
+            y: Float[Array, "n"],
+        ) -> Float[Array, ""]:
+            nll, _ = GaussianProcess.loss(
+                theta, jnp.exp(log_nugget), x_train_flat, y, profile=profile
+            )
+            return nll
 
         def gradient_at_zero(y: Float[Array, "n"]) -> Float[Array, "d g"]:
             # the nugget is the only free parameter left when every group is dead
             log_nugget = minimise(
-                lambda log_nugget: negative_loglikelihood(theta_zero, log_nugget, y),
-                x0=jnp.mean(jnp.log(nugget_range)),
-                bounds=(jnp.log(nugget_range[0]), jnp.log(nugget_range[1])),
+                lambda log_nugget: loss(theta_zero, log_nugget, y),
+                x0=jnp.mean(log_nugget_range),
+                bounds=(log_nugget_range[0], log_nugget_range[1]),
             ).x
-            return jax.grad(negative_loglikelihood)(theta_zero, log_nugget, y)
+            return jax.grad(loss)(theta_zero, log_nugget, y)
 
         # theta sits on its lower bound, so only inward components can revive a group
         grad = jnp.minimum(jax.vmap(gradient_at_zero)(y_train.T), 0.0)
-        return jnp.max(jnp.sqrt(reduce(grad**2, "... g -> g", "sum")))
+        return jnp.max(jnp.sqrt(reduce(grad**2, "o d g -> g", "sum")))
 
-    @classmethod
     @eqx.filter_jit
     def fit(
-        cls,
+        self,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
         l1_penalty: Float[Array, ""],
         *,
-        profile: KernelProfile,
         warmstart: ADMMState | None = None,
-        nugget_range: Float[Array, "2"] = jnp.array([0.001, 100]),
+        nugget_range: tuple[float, float] = (0.001, 100),
         max_iterations: int | Int[Array, ""] = jnp.array(300),
         **kwargs,
-    ) -> tuple[Self, Float[Array, ""], ADMMState, Float[Array, "g"]]:
+    ) -> tuple["GaussianProcess", Float[Array, ""], ADMMState, Float[Array, "g"]]:
+        profile = self.profile
         _, d, g = x_train.shape
         _, o = y_train.shape
         x_train_flat = rearrange(x_train, "n d g -> n (d g)")
@@ -219,20 +236,13 @@ class GaussianProcess(NamedTuple):
         theta_init, theta_lower, theta_upper = map(
             to_groups, (theta_init, theta_lower, theta_upper)
         )
-        lower = (theta_lower, jnp.log(nugget_range[0]))
-        upper = (theta_upper, jnp.log(nugget_range[1]))
+        log_nugget_range = jnp.log(jnp.asarray(nugget_range, dtype=x_train.dtype))
+        lower = (theta_lower, log_nugget_range[0])
+        upper = (theta_upper, log_nugget_range[1])
 
-        # negative loglikelihood for gp mle fit
-        def negative_loglikelihood(
-            theta: Float[Array, "d g"],
-            nugget: Float[Array, ""],
-            y: Float[Array, "n"],
-        ):
-            theta = rearrange(theta, "d g -> (d g)")
-            Koo = kernel(profile, theta, x_train_flat, x_train_flat)
-            Koo = Koo + nugget * jnp.eye(len(y))
-            llk, b, nu = gp_loglikelihood(Koo, y)
-            return -llk, (b, nu)
+        loss = lambda theta, nugget, y: GaussianProcess.loss(
+            theta, nugget, x_train_flat, y, profile=profile
+        )
 
         # x update step, one bound constrained gp mle per output
         def x_update(state: ADMMState) -> ADMMState:
@@ -247,9 +257,9 @@ class GaussianProcess(NamedTuple):
                     theta_and_log_nugget: tuple[Float[Array, "d g"], Float[Array, ""]],
                 ):
                     theta, log_nugget = theta_and_log_nugget
-                    loss, _ = negative_loglikelihood(theta, jnp.exp(log_nugget), y)
+                    nll, _ = loss(theta, jnp.exp(log_nugget), y)
                     lagrangian = 0.5 * jnp.sum((theta - theta_target) ** 2)
-                    return loss + state.rho * lagrangian
+                    return nll + state.rho * lagrangian
 
                 # optimize for a single output with l-bfgs-b
                 res = minimise(
@@ -258,26 +268,22 @@ class GaussianProcess(NamedTuple):
                     bounds=(lower, upper),
                     tol=cosine_schedule(state.iteration / max_iterations),
                 )
-                theta, log_nugget = res.x
-                return theta, log_nugget
+                return res.x
 
-            # vectorize over outputs
+            # vectorize over outputs, the nugget riding along outside the iterate
+            (log_nugget,) = state.aux
             theta, log_nugget = jax.vmap(solve_single)(
-                state.x, state.aux[0], state.z - state.u, y_train.T
+                state.x, log_nugget, state.z - state.u, y_train.T
             )
             return state._replace(x=theta, aux=(log_nugget,))
 
         # run the ADMM solver loop, cold start unless warmstarted
         theta0 = repeat(theta_init, "d g -> o d g", o=o)
+        zeros = jnp.zeros_like(theta0)
         state = (
             warmstart.restart()
             if warmstart is not None
-            else ADMMState(
-                x=theta0,
-                z=jnp.zeros_like(theta0),
-                u=jnp.zeros_like(theta0),
-                aux=(jnp.zeros((o,)),),
-            )
+            else ADMMState(x=theta0, z=zeros, u=zeros, aux=(jnp.zeros((o,)),))
         )
         state = solve(
             x_update,
@@ -287,15 +293,16 @@ class GaussianProcess(NamedTuple):
             **kwargs,
         )
 
-        # build the final model
+        # z is the shrunk iterate, the nugget comes from the aux block
         theta = state.z
-        nugget = jnp.exp(state.aux[0])
-        (nll, (b, nu)), grad = jax.vmap(
-            jax.value_and_grad(negative_loglikelihood, has_aux=True)
-        )(theta, nugget, y_train.T)
+        (log_nugget,) = state.aux
+        (nll, (b, nu)), grad = jax.vmap(jax.value_and_grad(loss, has_aux=True))(
+            theta, jnp.exp(log_nugget), y_train.T
+        )
 
-        # check group lasso stationarity, nugget is unpenalized so plain gradient
-        certificate = kkt_certificate(theta, grad, l1_penalty, theta_lower, theta_upper)
-
-        model = cls(profile, theta, nugget, b, nu, x_train, y_train)
+        # check group lasso stationarity of the penalized block alone
+        certificate = kkt_certificate(
+            theta, grad, l1_penalty, theta_lower, theta_upper
+        )
+        model = self._replace(theta=theta, nugget=jnp.exp(log_nugget), b=b, nu=nu)
         return model, nll.sum(), state, certificate

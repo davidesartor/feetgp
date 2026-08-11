@@ -17,13 +17,12 @@ def signal_data():
 
 
 def fit(x_train, y_train, l1, warmstart=None):
-    return GaussianProcess.fit(
+    return GaussianProcess(profile="rbf").fit(
         x_train,
         y_train,
         l1_penalty=jnp.array(l1),
         warmstart=warmstart,
         max_iterations=200,
-        profile="rbf",
     )
 
 

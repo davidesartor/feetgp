@@ -8,14 +8,14 @@ from einops import reduce
 
 RHO_MIN, RHO_MAX = 1e-4, 1e4
 
-# every leaf carries the group axis last, leading axes are free
+# every leaf carries the group axis last, the penalty pools across all of them
 Blocks = PyTree[Float[Array, "... g"]]
 
 
 def group_norm(tree: Blocks) -> Float[Array, "g"]:
     """Euclidean norm per group, pooled across every leaf."""
-    squares = jax.tree.map(lambda leaf: reduce(leaf**2, "... g -> g", "sum"), tree)
-    return jnp.sqrt(sum(jax.tree.leaves(squares)))
+    leaves = jax.tree.leaves(tree)
+    return jnp.sqrt(sum(reduce(leaf**2, "... g -> g", "sum") for leaf in leaves))
 
 
 class ADMMState(NamedTuple):
@@ -26,7 +26,9 @@ class ADMMState(NamedTuple):
     iteration: Int[Array, ""] = jnp.array(0)
     primal_residual: Float[Array, ""] = jnp.array(jnp.inf)
     dual_residual: Float[Array, ""] = jnp.array(jnp.inf)
-    aux: tuple[Any, ...] = ()
+
+    # side state the x update carries along, never penalized nor split
+    aux: Any = ()
 
     def converged(self, tol: Float[Array, ""]) -> Bool[Array, ""]:
         """Both residuals are relative, so one tolerance covers them."""
@@ -62,7 +64,7 @@ def update_z_and_u(state: ADMMState, l1_penalty: Float[Array, ""]) -> ADMMState:
 
 @eqx.filter_jit
 def update_residuals(state: ADMMState, prev: ADMMState) -> ADMMState:
-    # primal residual ||x - z||_2, relative to max(||x||_2, ||z||_2)
+    # primal residual ||x - z||_2, relative to the larger of the two blocks
     norm = lambda tree: jnp.linalg.norm(group_norm(tree))
     primal = norm(jax.tree.map(jnp.subtract, state.x, state.z))
     primal_target = jnp.maximum(norm(state.x), norm(state.z))
@@ -100,9 +102,17 @@ def solve(
     tol: Optional[float | Float[Array, ""]] = None,
     adapt_rho: bool | Bool[Array, ""] = jnp.array(True),
 ) -> ADMMState:
+    # the scalar defaults are built at import time, so only x carries the true precision
+    dtype = jax.tree.leaves(state.x)[0].dtype
+    state = state._replace(
+        rho=jnp.asarray(state.rho, dtype),
+        primal_residual=jnp.asarray(state.primal_residual, dtype),
+        dual_residual=jnp.asarray(state.dual_residual, dtype),
+    )
+
     # default tol depends on the machine precision
-    eps = jnp.finfo(jax.tree.leaves(state.x)[0].dtype).eps
-    tol = jnp.asarray(100 * eps) if tol is None else jnp.asarray(tol)
+    eps = jnp.finfo(dtype).eps
+    tol = jnp.asarray(100 * eps, dtype) if tol is None else jnp.asarray(tol, dtype)
 
     # define admm loop condition and body
     def while_condition(state: ADMMState) -> Bool[Array, ""]:

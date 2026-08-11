@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit the cold-fit array on a given chip, across both gpu partitions.
+# Submit the unpenalized-fit array on a given chip, across both gpu partitions.
 set -euo pipefail
 
 GPU=${GPU:-2080ti}
@@ -16,6 +16,6 @@ else
 fi
 
 sbatch ${QOS:+--qos="$QOS"} --constraint="$GPU" "${ARRAY_AND_TIME[@]}" \
-    --job-name="cold_fit_${GPU}_${DTYPE}_${PROFILE}" \
+    --job-name="unpenalized_fit_${GPU}_${DTYPE}_${PROFILE}" \
     --export=ALL,DTYPE="$DTYPE",PROFILE="$PROFILE",SIZES="$SIZES",BUDGET="${BUDGET:-1200}" \
-    bench/cold_fit/job_gpu.slurm
+    bench/unpenalized_fit/job_gpu.slurm

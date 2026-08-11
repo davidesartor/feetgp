@@ -69,8 +69,8 @@ def fit_certificate_at(x_train, y_train, theta, l1_penalty):
 
 def test_certificate_degrades_away_from_the_fit(toy_data):
     x_train, y_train = toy_data
-    model, _, _, certificate = GaussianProcess.fit(
-        x_train, y_train, l1_penalty=jnp.array(0.0), max_iterations=60, profile="rbf"
+    model, _, _, certificate = GaussianProcess(profile="rbf").fit(
+        x_train, y_train, l1_penalty=jnp.array(0.0), max_iterations=60
     )
     assert np.isfinite(certificate).all()
 
@@ -83,12 +83,11 @@ def test_certificate_degrades_away_from_the_fit(toy_data):
 def test_certificate_is_satisfied_once_every_group_is_dead(toy_data):
     x_train, y_train = toy_data
     l1_penalty = 1e4
-    model, _, _, certificate = GaussianProcess.fit(
+    model, _, _, certificate = GaussianProcess(profile="rbf").fit(
         x_train,
         y_train,
         l1_penalty=jnp.array(l1_penalty),
         max_iterations=60,
-        profile="rbf",
     )
     assert np.allclose(model.theta, 0.0)
     assert np.allclose(group_norms(model.theta), 0.0)

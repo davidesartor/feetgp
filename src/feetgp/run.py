@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--maxiter", type=int, default=300)
-    parser.add_argument("--tol", type=float, default=1e-5)
+    parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--lambda_budget", type=int, default=40)
     parser.add_argument("--lambda_ratio", type=float, default=0.85)
     parser.add_argument("--overwrite", action="store_true", default=False)
@@ -82,22 +82,24 @@ def linear_model(
 ) -> tuple[Callable, Callable, Callable]:
     """Closed-form x update, so there is nothing to warmstart."""
 
+    blank = Linear()
+
+    def lambda_max() -> Float[Array, ""]:
+        return blank.lambda_max(x_train, y_train)
+
     def fit(l1_penalty: float, warmstart: ADMMState | None = None):
-        return Linear.fit(
+        return blank.fit(
             x_train,
             y_train,
             jnp.array(l1_penalty),
             max_iterations=args.maxiter,
-            tol=jnp.array(args.tol),
+            tol=args.tol,
         )
 
     def predict(model: Linear, x: Float[Array, "m d g"]) -> Float[NDArray, "m o"]:
         return np.asarray(model.predict(x))
 
-    def lambda_max() -> float:
-        return float(Linear.lambda_max(x_train, y_train))
-
-    return fit, predict, lambda_max
+    return lambda_max, fit, predict
 
 
 def gp_model(
@@ -105,28 +107,29 @@ def gp_model(
     x_train: Float[Array, "n d g"],
     y_train: Float[Array, "n o"],
 ) -> tuple[Callable, Callable, Callable]:
+    blank = GaussianProcess(profile=args.profile)
+
+    def lambda_max() -> Float[Array, ""]:
+        return blank.lambda_max(x_train, y_train)
+
     def fit(l1_penalty: float, warmstart: ADMMState | None = None):
-        return GaussianProcess.fit(
+        return blank.fit(
             x_train,
             y_train,
             jnp.array(l1_penalty),
-            profile=args.profile,
             warmstart=warmstart,
             max_iterations=args.maxiter,
-            tol=jnp.array(args.tol),
+            tol=args.tol,
         )
 
     def predict(
         model: GaussianProcess, x: Float[Array, "m d g"]
     ) -> Float[NDArray, "m o"]:
         # mock query dim: per-point 1x1 covariance instead of full m x m
-        mean, _ = model.predict(x[:, None])
+        mean, _ = model.predict(x[:, None], x_train, y_train)
         return np.asarray(rearrange(mean, "m o 1 -> m o"))
 
-    def lambda_max() -> float:
-        return float(GaussianProcess.lambda_max(x_train, y_train, profile=args.profile))
-
-    return fit, predict, lambda_max
+    return lambda_max, fit, predict
 
 
 if __name__ == "__main__":
@@ -188,7 +191,7 @@ if __name__ == "__main__":
     store = RunStore(save_dir)
 
     build = linear_model if args.linear_model else gp_model
-    fit, predict, lambda_max = build(args, x_train, y_train)
+    lambda_max, fit, predict = build(args, x_train, y_train)
 
     def group_norms(model: Model) -> Float[NDArray, "g"]:
         norms = jnp.sqrt(reduce(model.theta**2, "... g -> g", "sum"))
@@ -210,9 +213,11 @@ if __name__ == "__main__":
         r2_test = r2_scores(model, x_test, y_test)
         r2_train = r2_scores(model, x_train, y_train)
         n_active = int(np.sum(gn > 1e-8))
+        # the solver only stops early when its own tolerance was met
+        converged = int(state.iteration) < args.maxiter
         print(f"lambda = {l1_penalty:.4g}")
         print(
-            f"    converged = {bool(state.converged(args.tol))}"
+            f"    converged = {converged}"
             f" in {int(state.iteration)} iterations"
             f" (r={float(state.primal_residual):.3e},"
             f" s={float(state.dual_residual):.3e})"
@@ -227,7 +232,7 @@ if __name__ == "__main__":
             l1_penalty=l1_penalty,
             n_active=n_active,
             n_groups=len(gn),
-            converged=bool(state.converged(args.tol)),
+            converged=converged,
             iterations=int(state.iteration),
             primal_residual=float(state.primal_residual),
             dual_residual=float(state.dual_residual),
@@ -266,7 +271,7 @@ if __name__ == "__main__":
         return row, state
 
     # the zero model anchors the path, everything above this penalty is all dead
-    start = lambda_max()
+    start = float(lambda_max())
     print(f"lambda_max = {start:.6g}")
 
     # relax geometrically from the zero model, each fit warmstarted from the last
