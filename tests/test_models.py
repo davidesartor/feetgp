@@ -17,7 +17,7 @@ from conftest import flat_design, group_norms, x_update_objective
 
 
 def gp_fit(x_train, y_train, profile, **kwargs):
-    return GaussianProcess(profile=profile).fit(x_train, y_train, **kwargs)
+    return GaussianProcess.fit(x_train, y_train, profile=profile, **kwargs)
 
 
 def test_linear_loss_grad_matches_closed_form(toy_data):

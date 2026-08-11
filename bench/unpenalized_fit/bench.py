@@ -43,7 +43,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def sanity_checks(model, state, certificate, n_groups: int, max_iterations: int) -> dict:
+def sanity_checks(
+    model, state, certificate, n_groups: int, max_iterations: int
+) -> dict:
     """At lambda = 0 nothing may be shrunk away and the fit must be stationary."""
     group_norms = jnp.sqrt(reduce(model.theta**2, "o d g -> g", "sum"))
     n_active = int(jnp.sum(group_norms > 1e-8))
@@ -89,10 +91,11 @@ if __name__ == "__main__":
 
         # full fit at lambda = 0, default iteration cap and tolerance
         def fit():
-            return GaussianProcess(args.profile).fit(
+            return GaussianProcess.fit(
                 x_train,
                 y_train,
                 jnp.zeros((), dtype=args.dtype),
+                profile=args.profile,
                 warmstart=None,
                 max_iterations=args.maxiter,
             )

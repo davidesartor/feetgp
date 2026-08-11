@@ -62,8 +62,8 @@ def test_loglikelihood_is_finite_at_the_smallest_nugget(profile, smooth_data):
 
 def test_fit_predicts_held_out_data(profile, smooth_data):
     x_train, y_train, x_test, y_test = smooth_data
-    model, nll, _, _ = GaussianProcess(profile=profile).fit(
-        x_train, y_train, l1_penalty=jnp.array(0.0), max_iterations=20
+    model, nll, _, _ = GaussianProcess.fit(
+        x_train, y_train, l1_penalty=jnp.array(0.0), profile=profile, max_iterations=20
     )
     assert np.isfinite(nll)
 
@@ -81,8 +81,8 @@ def test_fit_predicts_held_out_data(profile, smooth_data):
 
 def test_fit_stays_in_float32(profile, smooth_data):
     x_train, y_train, _, _ = smooth_data
-    model, nll, state, certificate = GaussianProcess(profile=profile).fit(
-        x_train, y_train, l1_penalty=jnp.array(0.1), max_iterations=5
+    model, nll, state, certificate = GaussianProcess.fit(
+        x_train, y_train, l1_penalty=jnp.array(0.1), profile=profile, max_iterations=5
     )
     leaves = jax.tree.leaves((model, nll, state, certificate))
     arrays = [leaf for leaf in leaves if eqx.is_array(leaf)]
@@ -92,8 +92,8 @@ def test_fit_stays_in_float32(profile, smooth_data):
 
 def test_fit_respects_its_bounds_and_kills_groups(profile, smooth_data):
     x_train, y_train, _, _ = smooth_data
-    model, _, _, certificate = GaussianProcess(profile=profile).fit(
-        x_train, y_train, l1_penalty=jnp.array(50.0), max_iterations=40
+    model, _, _, certificate = GaussianProcess.fit(
+        x_train, y_train, l1_penalty=jnp.array(50.0), profile=profile, max_iterations=40
     )
     assert (model.theta >= 0.0).all()
     assert np.allclose(model.nugget.clip(1e-3, 100.0), model.nugget, rtol=1e-6)

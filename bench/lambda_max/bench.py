@@ -76,7 +76,8 @@ if __name__ == "__main__":
         n, d, g = x_train.shape
         o = y_train.shape[1]
 
-        model = Linear() if args.linear_model else GaussianProcess(args.profile)
+        model = Linear if args.linear_model else GaussianProcess
+        model_kwargs = {} if args.linear_model else dict(profile=args.profile)
         row = dict(
             chip=chip, dtype=args.dtype, model="linear" if args.linear_model else "gp",
             profile=args.profile, target=args.target, n=n, d=d, g=g, o=o,
@@ -84,7 +85,7 @@ if __name__ == "__main__":
 
         try:
             lambda_seconds, lambda_max = time_call(
-                lambda: model.lambda_max(x_train, y_train)
+                lambda: model.lambda_max(x_train, y_train, **model_kwargs)
             )
         except Exception as error:
             message = str(error).splitlines()[0]
@@ -113,6 +114,7 @@ if __name__ == "__main__":
                     y_train,
                     l1_penalty,
                     max_iterations=args.maxiter,
+                    **model_kwargs,
                 )
 
             for repeat in range(args.max_repeats):

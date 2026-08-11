@@ -21,10 +21,7 @@ def centered(
 
 
 class Linear(NamedTuple):
-    fit_intercept: bool = True
     theta: Optional[Float[Array, "o d g"]] = None
-
-    # closed form from the centering, so the solver never sees it
     bias: Optional[Float[Array, "o"]] = None
 
     @eqx.filter_jit
@@ -42,28 +39,31 @@ class Linear(NamedTuple):
         residual = y - einsum(theta, x, "o d g, n d g -> n o")
         return 0.5 * jnp.sum(residual**2)
 
+    @staticmethod
     @eqx.filter_jit
     def lambda_max(
-        self,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
+        *,
+        fit_intercept: bool = True,
     ) -> Float[Array, ""]:
         """Smallest penalty that kills every group, from the gradient at theta = 0."""
         _, d, g = x_train.shape
         _, o = y_train.shape
-        x_mean, y_mean = centered(x_train, y_train, self.fit_intercept)
+        x_mean, y_mean = centered(x_train, y_train, fit_intercept)
         grad = jax.grad(Linear.loss)(
             jnp.zeros((o, d, g)), x_train - x_mean, y_train - y_mean
         )
         return jnp.max(jnp.sqrt(reduce(grad**2, "... g -> g", "sum")))
 
+    @staticmethod
     @eqx.filter_jit
     def fit(
-        self,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
         l1_penalty: Float[Array, ""],
         *,
+        fit_intercept: bool = True,
         max_iterations: int | Int[Array, ""] = jnp.array(300),
         **kwargs,
     ) -> tuple["Linear", Float[Array, ""], ADMMState, Float[Array, "g"]]:
@@ -71,7 +71,7 @@ class Linear(NamedTuple):
         _, o = y_train.shape
 
         # intercept is unpenalized, so centering gives it in closed form
-        x_mean, y_mean = centered(x_train, y_train, self.fit_intercept)
+        x_mean, y_mean = centered(x_train, y_train, fit_intercept)
 
         # precompute constant matrices
         design = rearrange(x_train - x_mean, "n d g -> n (d g)")
@@ -106,4 +106,4 @@ class Linear(NamedTuple):
             theta, x_train - x_mean, y_train - y_mean
         )
         certificate = kkt_certificate(theta, grad, l1_penalty)
-        return self._replace(theta=theta, bias=bias), loss, state, certificate
+        return Linear(theta=theta, bias=bias), loss, state, certificate

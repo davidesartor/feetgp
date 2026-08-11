@@ -82,13 +82,11 @@ def linear_model(
 ) -> tuple[Callable, Callable, Callable]:
     """Closed-form x update, so there is nothing to warmstart."""
 
-    blank = Linear()
-
     def lambda_max() -> Float[Array, ""]:
-        return blank.lambda_max(x_train, y_train)
+        return Linear.lambda_max(x_train, y_train)
 
     def fit(l1_penalty: float, warmstart: ADMMState | None = None):
-        return blank.fit(
+        return Linear.fit(
             x_train,
             y_train,
             jnp.array(l1_penalty),
@@ -107,16 +105,15 @@ def gp_model(
     x_train: Float[Array, "n d g"],
     y_train: Float[Array, "n o"],
 ) -> tuple[Callable, Callable, Callable]:
-    blank = GaussianProcess(profile=args.profile)
-
     def lambda_max() -> Float[Array, ""]:
-        return blank.lambda_max(x_train, y_train)
+        return GaussianProcess.lambda_max(x_train, y_train, profile=args.profile)
 
     def fit(l1_penalty: float, warmstart: ADMMState | None = None):
-        return blank.fit(
+        return GaussianProcess.fit(
             x_train,
             y_train,
             jnp.array(l1_penalty),
+            profile=args.profile,
             warmstart=warmstart,
             max_iterations=args.maxiter,
             tol=args.tol,

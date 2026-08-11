@@ -174,16 +174,16 @@ class GaussianProcess(NamedTuple):
         llk, b, nu = gp_loglikelihood(Koo, y)
         return -llk, (b, nu)
 
+    @staticmethod
     @eqx.filter_jit
     def lambda_max(
-        self,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
         *,
+        profile: KernelProfile,
         nugget_range: tuple[float, float] = (0.001, 100),
     ) -> Float[Array, ""]:
         """Smallest penalty that kills every group, from the gradient at theta = 0."""
-        profile = self.profile
         _, d, g = x_train.shape
         x_train_flat = rearrange(x_train, "n d g -> n (d g)")
         theta_zero = jnp.zeros((d, g), dtype=x_train.dtype)
@@ -212,19 +212,19 @@ class GaussianProcess(NamedTuple):
         grad = jnp.minimum(jax.vmap(gradient_at_zero)(y_train.T), 0.0)
         return jnp.max(jnp.sqrt(reduce(grad**2, "o d g -> g", "sum")))
 
+    @staticmethod
     @eqx.filter_jit
     def fit(
-        self,
         x_train: Float[Array, "n d g"],
         y_train: Float[Array, "n o"],
         l1_penalty: Float[Array, ""],
         *,
+        profile: KernelProfile,
         warmstart: ADMMState | None = None,
         nugget_range: tuple[float, float] = (0.001, 100),
         max_iterations: int | Int[Array, ""] = jnp.array(300),
         **kwargs,
     ) -> tuple["GaussianProcess", Float[Array, ""], ADMMState, Float[Array, "g"]]:
-        profile = self.profile
         _, d, g = x_train.shape
         _, o = y_train.shape
         x_train_flat = rearrange(x_train, "n d g -> n (d g)")
@@ -301,8 +301,8 @@ class GaussianProcess(NamedTuple):
         )
 
         # check group lasso stationarity of the penalized block alone
-        certificate = kkt_certificate(
-            theta, grad, l1_penalty, theta_lower, theta_upper
+        certificate = kkt_certificate(theta, grad, l1_penalty, theta_lower, theta_upper)
+        model = GaussianProcess(
+            profile=profile, theta=theta, nugget=jnp.exp(log_nugget), b=b, nu=nu
         )
-        model = self._replace(theta=theta, nugget=jnp.exp(log_nugget), b=b, nu=nu)
         return model, nll.sum(), state, certificate
